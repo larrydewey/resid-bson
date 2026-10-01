@@ -1,0 +1,52 @@
+ok   e/empty
+ok   e/trailing
+ok   e/doc empty
+ok   d/length four
+ok   d/length negative
+ok   d/length past input
+ok   d/length one short
+ok   d/no zero byte
+ok   d/zero byte not last
+ok   t/double as int
+ok   t/null as int
+ok   t/bool as int
+ok   t/string as int
+ok   t/binary as str
+ok   t/int as float
+ok   t/string as bytes
+ok   t/ObjectId
+ok   t/regexp
+ok   t/sequence value
+ok   t/document value
+ok   t/binary value
+ok   t/timestamp value
+ok   e/int32 short
+ok   e/int64 short
+ok   e/double short
+ok   e/decimal128 short
+ok   e/string length lies
+ok   e/string length zero
+ok   e/string no zero
+ok   e/binary short
+ok   e/binary subtype
+ok   e/name runs to the end
+ok   e/array element short
+ok   f/missing
+ok   f/duplicate
+ok   f/unknown skipped
+ok   f/unknown field
+ok   v/unknown
+ok   v/empty payload
+ok   v/empty document
+ok   v/two entries
+ok   n/negative as uint
+ok   n/decimal128 negative as uint
+ok   n/decimal128 NaN
+ok   n/decimal128 sign
+ok   u/truncated sequence
+ok   u/continuation first
+ok   u/bad continuation
+ok   u/name not text
+ok   hex/odd length
+ok   hex/bad digit
+exit 0

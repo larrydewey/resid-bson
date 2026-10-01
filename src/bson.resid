@@ -1,0 +1,1112 @@
+// bson.resid — BSON as a format for resid-serial.
+//
+// BSON is a document format: a document is a list of typed elements, each
+// with a name, and the document itself is length-prefixed. Two consequences
+// shape this encoder and decoder.
+//
+// A length prefix cannot be written before the bytes it counts, so the
+// encoder never writes bytes as it goes. Each open document collects its
+// elements as (name, type, bytes) triples, and when it closes it measures
+// them, prefixes the length and appends the finished document to the
+// element that was waiting for it. A type byte is known by the verb that
+// writes the value, so each element records it and the two are emitted
+// together.
+//
+// Everything is little-endian: int32 and int64, doubles, and decimal128.
+//
+// Representation choices, all of which round-trip through this package:
+//
+//   struct          a document, the field names as element names
+//   sequence        an array: a document whose elements are named "0", "1", …
+//   map             a document, the keys as element names, so a map key must
+//                   be a string
+//   variant         a unit variant is its name as a string, a variant with
+//                   a payload is a one-entry document {name: payload}
+//   option          None is null, Some(v) is v
+//   unit            null
+//   bytes           binary, subtype 0
+//   Int             int32 while it fits, else int64
+//   UInt(64)        int32 or int64; a value above 2^63 - 1 has no BSON
+//                   integer, so it is refused
+//   Int(128),
+//   UInt(128)       int32/int64 while they fit, else decimal128, whose 124
+//                   magnitude bits are the range a 128-bit value must stay
+//                   inside to be representable
+//   Float           a double: BSON has one float width, and a Float(32)
+//                   field widens
+//   NaN, infinity   written, since a double holds both
+//
+// The specification makes a document the top level of a stream. This package
+// also writes and reads a bare non-document value there, so that any type
+// with Encode/Decode instances can be a message; a document is still a
+// document, and a driver reading a legal BSON stream sees nothing unusual.
+
+import "../../resid-serial/src/serial.resid";
+import "bits.resid";
+
+// ─── Element types ──────────────────────────────────────────────────
+
+pub Int bs_t_double() { return 0x01; }
+pub Int bs_t_string() { return 0x02; }
+pub Int bs_t_doc() { return 0x03; }
+pub Int bs_t_array() { return 0x04; }
+pub Int bs_t_binary() { return 0x05; }
+pub Int bs_t_undefined() { return 0x06; }
+pub Int bs_t_bool() { return 0x08; }
+pub Int bs_t_null() { return 0x0A; }
+pub Int bs_t_int32() { return 0x10; }
+pub Int bs_t_int64() { return 0x12; }
+pub Int bs_t_dec128() { return 0x13; }
+
+// Binary subtype 0: generic bytes. 2 is the old "binary" spelling and 4 a
+// UUID; both read as bytes too.
+pub Int bs_t_sub_generic() { return 0x00; }
+
+Str bs_type_name(Int t) {
+    if (t == 0x01) { return "a double"; }
+    if (t == 0x02) { return "a string"; }
+    if (t == 0x03) { return "a document"; }
+    if (t == 0x04) { return "an array"; }
+    if (t == 0x05) { return "binary"; }
+    if (t == 0x06) { return "undefined"; }
+    if (t == 0x07) { return "an ObjectId"; }
+    if (t == 0x08) { return "a boolean"; }
+    if (t == 0x09) { return "a UTC datetime"; }
+    if (t == 0x0A) { return "null"; }
+    if (t == 0x0B) { return "a regular expression"; }
+    if (t == 0x0F) { return "JavaScript code with a scope"; }
+    if (t == 0x10) { return "a 32-bit integer"; }
+    if (t == 0x11) { return "a timestamp"; }
+    if (t == 0x12) { return "a 64-bit integer"; }
+    if (t == 0x13) { return "a decimal128"; }
+    return f"element type {bs_hex([t])}";
+}
+
+// ─── The encoder ────────────────────────────────────────────────────
+
+// An element's bytes, newest first, so a verb can prepend in O(1).
+type BsBytes = BbNil | BbCons(BsByte);
+type BsByte = { Int b; BsBytes next; };
+
+// One element: its name, the type byte its value needs, and the value's
+// bytes. The type is filled in by the verb that writes the value, which is
+// why the two live in one record.
+type BsElem = { Str name; Int type; BsBytes bytes; };
+
+// The elements of the open document, newest first.
+type BsElems = BeNil | BeCons(BsElemLink);
+type BsElemLink = { BsElem el; BsElems next; };
+
+// A document waiting to be finished, with the index counter it had.
+type BsSaved = BsNil | BsPush(BsSave);
+type BsSave = { BsElems elems; Int idx; BsSaved next; };
+
+// What the next value being written belongs to: a name already given, a map
+// key that is being written now, or nothing.
+type BsPending = BpNone | BpName(Str) | BpKey;
+
+type BsonEnc = {
+    BsElems elems;
+    BsSaved saved;
+    List(Int) top;
+    Int idx;
+    BsPending pending;
+};
+
+pub BsonEnc bson_encoder() { return BsonEnc {.elems = BeNil, .saved = BsNil, .top = [], .idx = 0, .pending = BpNone}; }
+
+// A document is open exactly while one is on the stack of saved ones.
+Bool bs_open(BsonEnc e) {
+    BsSaved saved = e.saved;
+    return match saved { BsNil => false, BsPush(_) => true };
+}
+
+// The finished message: a document, or a bare value written at the top.
+pub List(Int) bson_bytes(BsonEnc e) { return e.top; }
+
+BsonEnc be_of(BsElems elems, BsSaved saved, List(Int) top, Int idx, BsPending pending) {
+    return BsonEnc {.elems = elems, .saved = saved, .top = top, .idx = idx, .pending = pending};
+}
+
+BsElems bs_push(BsElems es, BsElem el) { return BeCons(BsElemLink {.el = el, .next = es}); }
+
+BsBytes bs_chain(List(Int) bs) { return bs_chain_at(bs, 0, BbNil); }
+
+BsBytes bs_chain_at(List(Int) bs, Int i, BsBytes acc) {
+    if (i >= bs.len()) { return acc; }
+    return bs_chain_at(bs, i + 1, BbCons(BsByte {.b = bs[i], .next = acc}));
+}
+
+// `bs` after the chain: the first byte of bs precedes what is already there.
+BsBytes bs_after(BsBytes head, List(Int) bs) { return bs_after_at(bs, bs.len() - 1, head); }
+
+BsBytes bs_after_at(List(Int) bs, Int i, BsBytes acc) {
+    if (i < 0) { return acc; }
+    return bs_after_at(bs, i - 1, BbCons(BsByte {.b = bs[i], .next = acc}));
+}
+
+List(Int) bs_bytes_of(BsBytes b) { return bs_bytes_of_at(b, []); }
+
+List(Int) bs_bytes_of_at(BsBytes bytes, List(Int) acc) {
+    return match bytes { BbNil => acc, BbCons(x) => bs_bytes_of_at(x.next, acc.concat([x.b])) };
+}
+
+// A name is given; the value that follows belongs to it.
+BsonEnc bs_named(BsonEnc e, Str name) {
+    return be_of(bs_push(e.elems, BsElem {.name = name, .type = 0, .bytes = BbNil}), e.saved, e.top, e.idx, BpName(name));
+}
+
+// The element the value being written goes into: the one a name is waiting
+// for, the one holding a map key, or a fresh one. A value with no document
+// open is the message itself, and its bytes go straight to the top.
+BsonEnc bs_slot(BsonEnc e, Int type) {
+    BsPending pending = e.pending;
+    return match pending {
+        BpName(n) => bs_retype(e, type),
+        BpKey => bs_retype(e, type),
+        BpNone => if (bs_open(e)) {
+            be_of(bs_push(e.elems, BsElem {.name = "", .type = type, .bytes = BbNil}), e.saved, e.top, e.idx, BpNone)
+        } else { e }
+    };
+}
+
+BsonEnc bs_retype(BsonEnc e, Int type) {
+    BsElems elems = e.elems;
+    BsElems es = match elems {
+        BeNil => BeNil,
+        BeCons(link) => BeCons(BsElemLink {.el = BsElem {.name = link.el.name, .type = type, .bytes = link.el.bytes}, .next = link.next})
+    };
+    return be_of(es, e.saved, e.top, e.idx, BpNone);
+}
+
+// Bytes into the current element, or onto the top when nothing is open.
+BsonEnc be_put(BsonEnc e, List(Int) bs) {
+    if (!bs_open(e)) { return be_of(e.elems, e.saved, e.top.concat(bs), e.idx, e.pending); }
+    BsElems elems = e.elems;
+    BsElems es = match elems {
+        BeNil => BeCons(BsElemLink {.el = BsElem {.name = "", .type = 0, .bytes = bs_chain(bs)}, .next = BeNil}),
+        BeCons(link) => BeCons(BsElemLink {.el = BsElem {.name = link.el.name, .type = link.el.type, .bytes = bs_after(link.el.bytes, bs)}, .next = link.next})
+    };
+    return be_of(es, e.saved, e.top, e.idx, e.pending);
+}
+
+// ─── The encoder's verbs ────────────────────────────────────────────
+
+// A value's bytes. The type byte joins them only when the value is the
+// message itself: inside a document the element already carries the type,
+// in front of the name, and the value's own bytes are what follow.
+BsonEnc be_typed(BsonEnc e, Int type, List(Int) payload) {
+    BsPending pending = e.pending;
+    if (p_is_named(pending)) { return be_put(bs_retype(e, type), payload); }
+    if (bs_open(e)) { return be_put(bs_slot(e, type), payload); }
+    return be_put(e, [type].concat(payload));
+}
+
+Bool p_is_named(BsPending p) { return match p { BpName(_) => true, BpKey => true, BpNone => false }; }
+
+Result(BsonEnc, SerialError) be_unit(BsonEnc e) { return Ok(be_typed(e, 0x0A, [])); }
+
+Result(BsonEnc, SerialError) be_bool(BsonEnc e, Bool v) { return Ok(be_typed(e, 0x08, [if (v) { 1 } else { 0 }])); }
+
+// The narrowest integer that holds v: int32, else int64.
+Result(BsonEnc, SerialError) be_int(BsonEnc e, Int v) {
+    if (v >= 0 - 2147483648 && v <= 2147483647) { return Ok(be_typed(e, 0x10, bs_i4(v))); }
+    return Ok(be_typed(e, 0x12, bs_i8(v)));
+}
+
+Result(BsonEnc, SerialError) be_uint(BsonEnc e, UInt(64) v) {
+    if (v > u64(9223372036854775807)) { return Err(invalid_value(f"{v}", "a BSON integer, whose largest is 2^63 - 1")); }
+    if (v <= u64(2147483647)) { return Ok(be_typed(e, 0x10, bs_i4((Int)v))); }
+    return Ok(be_typed(e, 0x12, bs_i8((Int)v)));
+}
+
+Result(BsonEnc, SerialError) be_i128(BsonEnc e, Int(128) v) {
+    if (v >= i128(0) - i128(9223372036854775807) - i128(1) && v <= i128(9223372036854775807)) { return be_int(e, (Int)v); }
+    UInt(128) mag = bs_mag128(v);
+    if (mag > bs_dec128_max()) { return Err(invalid_value(f"{v}", "a BSON decimal128, whose magnitude is at most 2^124 - 1")); }
+    return Ok(be_typed(e, 0x13, bs_dec128_bytes(mag, v < i128(0))));
+}
+
+Result(BsonEnc, SerialError) be_u128(BsonEnc e, UInt(128) v) {
+    if (v <= u128(9223372036854775807)) { return be_uint(e, (UInt(64))v); }
+    if (v > bs_dec128_max()) { return Err(invalid_value(f"{v}", "a BSON decimal128, whose magnitude is at most 2^124 - 1")); }
+    return Ok(be_typed(e, 0x13, bs_dec128_bytes(v, false)));
+}
+
+// BSON has one float width.
+Result(BsonEnc, SerialError) be_float(BsonEnc e, Float v) { return Ok(be_typed(e, 0x01, bs_f64_bits(v))); }
+
+// A string: int32 length counting the zero byte, the UTF-8, the zero byte.
+Result(BsonEnc, SerialError) be_str(BsonEnc e, Str v) { return be_estr(e, bs_str_bytes(v)); }
+
+Result(BsonEnc, SerialError) be_estr(BsonEnc e, List(Int) bs) {
+    return Ok(be_typed(e, 0x02, bs_i4(bs.len() + 1).concat(bs).concat([0])));
+}
+
+// Binary: int32 length, a subtype byte, the data.
+Result(BsonEnc, SerialError) be_bytes(BsonEnc e, List(Int) v) { return be_ebin(e, v); }
+
+Result(BsonEnc, SerialError) be_ebin(BsonEnc e, List(Int) v) { return Ok(be_typed(e, 0x05, bs_i4(v.len()).concat([0x00]).concat(v))); }
+
+// A streamed string was promised its byte length up front, so the head goes
+// out before the first code point and only the closing zero waits.
+Result(BsonEnc, SerialError) be_str_begin(BsonEnc e, Int chars, Int bytes) { return Ok(be_typed(e, 0x02, bs_i4(bytes + 1))); }
+
+Result(BsonEnc, SerialError) be_str_char(BsonEnc e, Int cp) { return Ok(be_put(e, bs_cp_bytes(cp))); }
+Result(BsonEnc, SerialError) be_str_end(BsonEnc e) { return Ok(be_put(e, [0])); }
+Result(BsonEnc, SerialError) be_bytes_begin(BsonEnc e, Int len) { return Ok(be_typed(e, 0x05, bs_i4(len).concat([0x00]))); }
+Result(BsonEnc, SerialError) be_byte(BsonEnc e, Int b) { return Ok(be_put(e, [b])); }
+Result(BsonEnc, SerialError) be_bytes_end(BsonEnc e) { return Ok(e); }
+
+Result(BsonEnc, SerialError) be_none(BsonEnc e) { return Ok(be_typed(e, 0x0A, [])); }
+Result(BsonEnc, SerialError) be_some(BsonEnc e) { return Ok(e); }
+
+// A document opens where it stands and closes into the element that was
+// waiting for it.
+Result(BsonEnc, SerialError) be_doc_begin(BsonEnc e, Int type) {
+    BsonEnc e1 = bs_slot(e, type);
+    return Ok(be_of(BeNil, BsPush(BsSave {.elems = e1.elems, .idx = e1.idx, .next = e1.saved}), e1.top, 0, BpNone));
+}
+
+Result(BsonEnc, SerialError) be_doc_end(BsonEnc e) {
+    List(Int) body = bs_doc_bytes(e.elems);
+    BsonEnc e1 = bs_pop(e);
+    if (bs_open(e1)) { return Ok(be_put(e1, body)); }
+    return Ok(be_of(e1.elems, e1.saved, e1.top.concat(body), e1.idx, e1.pending));
+}
+
+BsonEnc bs_pop(BsonEnc e) {
+    BsSaved saved = e.saved;
+    return match saved {
+        BsNil => be_of(e.elems, BsNil, e.top, e.idx, e.pending),
+        BsPush(save) => be_of(save.elems, save.next, e.top, save.idx, e.pending)
+    };
+}
+
+// The document's own bytes: its length, its elements, its zero byte. The
+// length counts all three.
+List(Int) bs_doc_bytes(BsElems es) {
+    List(Int) payload = bs_emit(bs_ordered(es), 0, []);
+    return bs_i4(payload.len() + 5).concat(payload).concat([0]);
+}
+
+List(BsElem) bs_ordered(BsElems es) { return bs_ordered_at(es, []); }
+
+// The elements as the wire has them: oldest first, which is the reverse of
+// the order they were written in.
+List(BsElem) bs_ordered_at(BsElems elems, List(BsElem) acc) {
+    return match elems { BeNil => acc, BeCons(link) => bs_ordered_at(link.next, [link.el].concat(acc)) };
+}
+
+// Each element as the wire has it: the type byte, the name and its zero
+// byte, then the value.
+List(Int) bs_emit(List(BsElem) es, Int i, List(Int) acc) {
+    if (i >= es.len()) { return acc; }
+    BsElem el = es[i];
+    List(Int) head = [el.type].concat(bs_str_bytes(el.name)).concat([0]);
+    return bs_emit(es, i + 1, acc.concat(head).concat(bs_bytes_of(el.bytes)));
+}
+
+Result(BsonEnc, SerialError) be_seq_begin(BsonEnc e, Int len) { return be_doc_begin(e, 0x04); }
+
+// An array's elements are named by their index, which the encoder counts.
+Result(BsonEnc, SerialError) be_seq_elem(BsonEnc e) {
+    BsonEnc e1 = bs_named(e, f"{e.idx}");
+    return Ok(be_of(e1.elems, e1.saved, e1.top, e1.idx + 1, e1.pending));
+}
+
+Result(BsonEnc, SerialError) be_seq_end(BsonEnc e) { return be_doc_end(e); }
+
+Result(BsonEnc, SerialError) be_map_begin(BsonEnc e, Int len) { return be_doc_begin(e, 0x03); }
+
+// A map key arrives as a value and has to become an element name, so the
+// slot waits for it.
+Result(BsonEnc, SerialError) be_map_key(BsonEnc e) {
+    return Ok(be_of(bs_push(e.elems, BsElem {.name = "", .type = 0, .bytes = BbNil}), e.saved, e.top, e.idx, BpKey));
+}
+
+// The key that was just written becomes the element's name, and the value
+// that follows fills it.
+Result(BsonEnc, SerialError) be_map_value(BsonEnc e) {
+    Result(Str, SerialError) k = bs_key_name(e.elems);
+    if (Err(err) = k) { return Err(err); }
+    return match k {
+        Ok(name) => be_map_value_named(e, name),
+        Err(_) => Err(custom_error("unreachable"))
+    };
+}
+
+Result(BsonEnc, SerialError) be_map_value_named(BsonEnc e, Str name) {
+    BsElems elems = e.elems;
+    BsElems es = match elems {
+        BeNil => BeNil,
+        BeCons(link) => BeCons(BsElemLink {.el = BsElem {.name = name, .type = 0, .bytes = BbNil}, .next = link.next})
+    };
+    return Ok(be_of(es, e.saved, e.top, e.idx, BpName(name)));
+}
+
+// The name in the key that was just written: an element's bytes are a
+// string's own bytes, so the name is what is between the length and the
+// closing zero.
+Result(Str, SerialError) bs_key_name(BsElems elems) {
+    return match elems {
+        BeNil => Err(custom_error("a BSON map key is missing")),
+        BeCons(link) => bs_key_str(link.el)
+    };
+}
+
+Result(Str, SerialError) bs_key_str(BsElem el) {
+    if (el.type != 0x02) { return Err(unsupported("a BSON element name that is not a string")); }
+    List(Int) bs = bs_bytes_of(el.bytes);
+    if (bs.len() < 5) { return Err(invalid_length(bs.len(), "a BSON string of at least one byte")); }
+    Int n = bs_read_signed(bs, 0, 4);
+    if (n != bs.len() - 4) { return Err(invalid_length(n, f"a BSON string of {bs.len() - 4} byte(s)")); }
+    return bs_str_at(bs, 4, bs.len() - 1, "a BSON element name");
+}
+
+Result(BsonEnc, SerialError) be_map_end(BsonEnc e) { return be_doc_end(e); }
+
+Result(BsonEnc, SerialError) be_struct_begin(BsonEnc e, Str name, Int len) { return be_doc_begin(e, 0x03); }
+Result(BsonEnc, SerialError) be_field(BsonEnc e, Str key) { return Ok(bs_named(e, key)); }
+Result(BsonEnc, SerialError) be_struct_end(BsonEnc e) { return be_doc_end(e); }
+
+Result(BsonEnc, SerialError) be_unit_variant(BsonEnc e, Str enum_name, Int index, Str variant) {
+    return be_estr(e, bs_str_bytes(variant));
+}
+
+// A variant with a payload is a one-entry document keyed by its name.
+Result(BsonEnc, SerialError) be_variant_begin(BsonEnc e, Str enum_name, Int index, Str variant) {
+    Result(BsonEnc, SerialError) d = be_doc_begin(e, 0x03);
+    if (Err(err) = d) { return Err(err); }
+    return match d { Ok(open) => Ok(bs_named(open, variant)), Err(_) => Err(custom_error("unreachable")) };
+}
+
+Result(BsonEnc, SerialError) be_variant_end(BsonEnc e) { return be_doc_end(e); }
+Bool be_human(BsonEnc e) { return false; }
+
+Encoder(BsonEnc) = {
+    .write_unit = be_unit, .write_bool = be_bool, .write_int = be_int, .write_uint = be_uint,
+    .write_i128 = be_i128, .write_u128 = be_u128,
+    .write_float = be_float, .write_str = be_str, .write_bytes = be_bytes, .write_none = be_none,
+    .write_str_begin = be_str_begin, .write_str_char = be_str_char, .write_str_end = be_str_end,
+    .write_bytes_begin = be_bytes_begin, .write_byte = be_byte, .write_bytes_end = be_bytes_end,
+    .write_some = be_some, .write_seq_begin = be_seq_begin, .write_seq_elem = be_seq_elem, .write_seq_end = be_seq_end,
+    .write_map_begin = be_map_begin, .write_map_key = be_map_key, .write_map_value = be_map_value, .write_map_end = be_map_end,
+    .write_struct_begin = be_struct_begin, .write_field = be_field, .write_struct_end = be_struct_end,
+    .write_unit_variant = be_unit_variant, .write_variant_begin = be_variant_begin, .write_variant_end = be_variant_end,
+    .encodes_human_readable = be_human
+};
+
+@needs(Encode(T, BsonEnc))
+pub Result(List(Int), SerialError) to_bson(T x) {
+    BsonEnc e = encode(x, bson_encoder())?;
+    return Ok(bson_bytes(e));
+}
+
+@needs(Encode(T, BsonEnc))
+pub Result(Str, SerialError) to_bson_hex(T x) {
+    BsonEnc e = encode(x, bson_encoder())?;
+    return Ok(bs_hex(bson_bytes(e)));
+}
+
+// ─── The decoder ────────────────────────────────────────────────────
+
+// An open container: the offset just past its content, which for a
+// document is the position of its closing zero byte.
+type BsFrame = BsDoc(Int) | BsStr(Int) | BsBin(Int);
+
+// An element's type byte belongs to the element, not to its value: the
+// name comes after it and the value's own bytes come after the name. So the
+// verb that reads the name leaves the type behind for the verb that reads
+// the value, and etype is -1 when no element is waiting for its value.
+type BsonDec = {
+    List(Int) in;
+    Int pos;
+    List(BsFrame) open;
+    Int payloads;
+    Int vmaps;
+    Int etype;
+    Bool mkey;
+};
+
+pub BsonDec bson_decoder(List(Int) bs) {
+    List(BsFrame) none = [];
+    return BsonDec {.in = bs, .pos = 0, .open = none, .payloads = 0, .vmaps = 0, .etype = 0 - 1, .mkey = false};
+}
+
+BsonDec bd_at(BsonDec d, Int pos, List(BsFrame) open) { return bd_key(d, d.mkey, pos, open); }
+
+BsonDec bd_key(BsonDec d, Bool mkey, Int pos, List(BsFrame) open) {
+    return BsonDec {.in = d.in, .pos = pos, .open = open, .payloads = d.payloads, .vmaps = d.vmaps, .etype = d.etype, .mkey = mkey};
+}
+
+BsonDec bd_push(BsonDec d, BsFrame f) { return bd_at(d, d.pos, d.open.concat([f])); }
+BsonDec bd_pop(BsonDec d) {
+    Int k = d.open.len();
+    if (k == 0) { return d; }
+    return bd_at(d, d.pos, d.open[0..k - 1]);
+}
+BsonDec bd_take(BsonDec d, Int n) { return bd_at(d, d.pos + n, d.open); }
+BsonDec bd_payloads(BsonDec d, Int n) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = n, .vmaps = d.vmaps, .etype = d.etype, .mkey = d.mkey}; }
+BsonDec bd_vmaps(BsonDec d, Int n) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = d.payloads, .vmaps = n, .etype = d.etype, .mkey = d.mkey}; }
+
+// The element whose value is about to be read, and its type.
+BsonDec bd_pending(BsonDec d, Int t) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = d.payloads, .vmaps = d.vmaps, .etype = t, .mkey = d.mkey}; }
+
+// The next element is a map key: its name is the key, and the type behind
+// it belongs to the value.
+BsonDec bd_mkey(BsonDec d, Int t) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = d.payloads, .vmaps = d.vmaps, .etype = t, .mkey = true}; }
+
+// The type of the value that comes next: the element's own, or a fresh
+// type byte at the top level.
+Result(Parsed(Int, BsonDec), SerialError) bd_take_type(BsonDec d, Str what) {
+    if (d.etype >= 0) { return parsed(d.etype, bd_pending(d, 0 - 1)); }
+    return bd_read_type(d, what);
+}
+
+// The type of the value that comes next, and the state at its bytes.
+Result(BsOpen, SerialError) bd_open_type(BsonDec d, Str what) {
+    Parsed(Int, BsonDec) t = bd_take_type(d, what)?;
+    return Ok(BsOpen {.type = t.value, .rest = t.rest});
+}
+
+type BsOpen = { Int type; BsonDec rest; };
+
+// Where the open document's content ends, or -1 when no document is open.
+Int bd_doc_end(BsonDec d) {
+    Int k = d.open.len();
+    if (k == 0) { return 0 - 1; }
+    BsFrame f = d.open[k - 1];
+    return match f { BsDoc(end) => end, BsStr(_) => 0 - 1, BsBin(_) => 0 - 1 };
+}
+
+// ─── Element heads ──────────────────────────────────────────────────
+
+// The type byte at the read position, and the state just past it.
+Result(Parsed(Int, BsonDec), SerialError) bd_read_type(BsonDec d, Str what) {
+    if (d.pos >= d.in.len()) { return Err(eof_error(what)); }
+    return parsed(d.in[d.pos], bd_take(d, 1));
+}
+
+// A cstring: bytes up to the zero, read as UTF-8.
+Result(Parsed(Str, BsonDec), SerialError) bd_cstring(BsonDec d, Str what) { return bd_cstring_at(d, d.pos, what); }
+
+Result(Parsed(Str, BsonDec), SerialError) bd_cstring_at(BsonDec d, Int at, Str what) {
+    Int end = bd_zero(d, at, what);
+    if (end < 0) { return Err(eof_error(what)); }
+    Str s = bs_str_at(d.in, at, end, what)?;
+    return parsed(s, bd_at(d, end + 1, d.open));
+}
+
+// The cstring's end, and the state just past it.
+BsonDec bd_cstring_to(BsonDec d, Str what) {
+    Int end = bd_zero(d, d.pos, what);
+    if (end < 0) { return d; }
+    return bd_at(d, end + 1, d.open);
+}
+
+// The zero byte that ends a cstring, or -1.
+Int bd_zero(BsonDec d, Int at, Str what) { return bd_zero_at(d, at, what, d.in.len()); }
+
+Int bd_zero_at(BsonDec d, Int at, Str what, Int end) {
+    if (at >= end) { return 0 - 1; }
+    if (d.in[at] == 0) { return at; }
+    return bd_zero_at(d, at + 1, what, end);
+}
+
+// An int32 payload, and the state just past it.
+Result(Parsed(Int, BsonDec), SerialError) bd_i32(BsonDec d, Str what) {
+    if (!bs_has(d.in, d.pos, 4)) { return Err(eof_error(what)); }
+    return parsed(bs_read_signed(d.in, d.pos, 4), bd_take(d, 4));
+}
+
+// An element's type byte and name: the head every name in the format is
+// behind.
+// A cstring is the element's name; the type byte in front of it belongs to
+// the element, so bd_open_type hands the value its own type and the state
+// at its name.
+type BsElemHead = { Int type; Str name; BsonDec rest_state; };
+
+Result(Parsed(BsElemHead, BsonDec), SerialError) bd_elem_head(BsonDec d, Str what) {
+    BsOpen o = bd_open_type(d, what)?;
+    return bd_elem_head_at(o.rest, o.type, what);
+}
+
+Result(Parsed(BsElemHead, BsonDec), SerialError) bd_elem_head_at(BsonDec d, Int t, Str what) {
+    BsonDec d1 = bs_take_open(d);
+    Result(Parsed(Str, BsonDec), SerialError) n = bd_cstring(d1, what);
+    if (Err(e) = n) { return Err(e); }
+    return match n { Ok(s) => parsed(BsElemHead {.type = t, .name = s.value, .rest_state = s.rest}, s.rest), Err(_) => Err(custom_error("unreachable")) };
+}
+
+BsonDec bs_take_open(BsonDec d) { return d; }
+
+// The type byte's value alone, from the bytes at the read position.
+Result(Int, SerialError) bd_type_int(BsonDec d, Str what) {
+    if (d.pos >= d.in.len()) { return Err(eof_error(what)); }
+    return Ok(d.in[d.pos]);
+}
+
+// An element's head without the state.
+Result(BsElemHead, SerialError) bd_elem(BsonDec d, Str what) {
+    Result(Parsed(BsElemHead, BsonDec), SerialError) h = bd_elem_head(d, what);
+    if (Err(e) = h) { return Err(e); }
+    return match h { Ok(x) => Ok(x.value), Err(_) => Err(custom_error("unreachable")) };
+}
+
+// ─── Scalars ────────────────────────────────────────────────────────
+
+Result(BsonDec, SerialError) bd_unit(BsonDec d) {
+    BsOpen o = bd_open_type(d, "null")?;
+    if (o.type != 0x0A && o.type != 0x06) { return Err(invalid_type("null", bs_type_name(o.type))); }
+    return Ok(o.rest);
+}
+
+Result(Parsed(Bool, BsonDec), SerialError) bd_bool(BsonDec d) {
+    BsOpen o = bd_open_type(d, "a boolean")?;
+    if (o.type != 0x08) { return Err(invalid_type("a boolean", bs_type_name(o.type))); }
+    if (o.rest.pos >= o.rest.in.len()) { return Err(eof_error("a boolean")); }
+    Int b = o.rest.in[o.rest.pos];
+    if (b > 1) { return Err(invalid_value(f"{b}", "a BSON boolean, 0 or 1")); }
+    return parsed(b == 1, bd_take(o.rest, 1));
+}
+
+Result(Parsed(Int, BsonDec), SerialError) bd_int(BsonDec d) { return bd_signed(d, "an integer"); }
+
+Result(Parsed(Int, BsonDec), SerialError) bd_signed(BsonDec d, Str what) {
+    BsOpen o = bd_open_type(d, what)?;
+    if (o.type == 0x10) {
+        if (!bs_has(o.rest.in, o.rest.pos, 4)) { return Err(eof_error("a 32-bit integer")); }
+        return parsed(bs_read_signed(o.rest.in, o.rest.pos, 4), bd_take(o.rest, 4));
+    }
+    if (o.type == 0x12) {
+        if (!bs_has(o.rest.in, o.rest.pos, 8)) { return Err(eof_error("a 64-bit integer")); }
+        return parsed(bs_read_signed(o.rest.in, o.rest.pos, 8), bd_take(o.rest, 8));
+    }
+    return Err(invalid_type(what, bs_type_name(o.type)));
+}
+
+Result(Parsed(UInt(64), BsonDec), SerialError) bd_uint(BsonDec d) {
+    Parsed(Int, BsonDec) n = bd_signed(d, "an unsigned integer")?;
+    if (n.value < 0) { return Err(invalid_value(f"{n.value}", "an unsigned integer")); }
+    return parsed((UInt(64))n.value, n.rest);
+}
+
+Result(Parsed(Int(128), BsonDec), SerialError) bd_i128(BsonDec d) { return bd_any128(d, "a 128-bit integer"); }
+
+// A 128-bit value from decimal128, or from the plain integers.
+Result(Parsed(Int(128), BsonDec), SerialError) bd_any128(BsonDec d, Str what) {
+    BsOpen o = bd_open_type(d, what)?;
+    if (o.type == 0x13) {
+        if (!bs_has(o.rest.in, o.rest.pos, 16)) { return Err(eof_error("a decimal128")); }
+        Int(128) v = bs_dec128_from(o.rest.in, o.rest.pos)?;
+        return parsed(v, bd_take(o.rest, 16));
+    }
+    if (o.type == 0x10 || o.type == 0x12) {
+        Int n = if (o.type == 0x10) { 4 } else { 8 };
+        if (!bs_has(o.rest.in, o.rest.pos, n)) { return Err(eof_error(what)); }
+        return parsed((Int(128))bs_read_signed(o.rest.in, o.rest.pos, n), bd_take(o.rest, n));
+    }
+    return Err(invalid_type(what, bs_type_name(o.type)));
+}
+
+Result(Parsed(UInt(128), BsonDec), SerialError) bd_u128(BsonDec d) {
+    Parsed(Int(128), BsonDec) n = bd_any128(d, "an unsigned 128-bit integer")?;
+    if (n.value < i128(0)) { return Err(invalid_value(f"{n.value}", "an unsigned 128-bit integer")); }
+    return parsed(u128(n.value), n.rest);
+}
+
+Result(Parsed(Float, BsonDec), SerialError) bd_float(BsonDec d) {
+    BsOpen o = bd_open_type(d, "a float")?;
+    if (o.type != 0x01) { return Err(invalid_type("a float", bs_type_name(o.type))); }
+    if (!bs_has(o.rest.in, o.rest.pos, 8)) { return Err(eof_error("a double")); }
+    return parsed(bs_f64_from(o.rest.in, o.rest.pos), bd_take(o.rest, 8));
+}
+
+// ─── Strings and bytes ──────────────────────────────────────────────
+
+// A string: int32 length counting the zero byte, the UTF-8, the zero byte.
+Result(Parsed(Str, BsonDec), SerialError) bd_str(BsonDec d) {
+    if (d.mkey) { return bd_map_key(d); }
+    return bd_str_at(d, "a string");
+}
+
+// A map key is the element's name, so it arrives as a cstring, and the
+// element's type belongs to the value that follows.
+Result(Parsed(Str, BsonDec), SerialError) bd_map_key(BsonDec d) {
+    Result(Parsed(Str, BsonDec), SerialError) n = bd_cstring(d, "a map key");
+    if (Err(e) = n) { return Err(e); }
+    return match n { Ok(x) => parsed(x.value, bd_key(x.rest, false, x.rest.pos, x.rest.open)), Err(_) => Err(custom_error("unreachable")) };
+}
+
+Result(Parsed(Str, BsonDec), SerialError) bd_str_at(BsonDec d, Str what) {
+    BsOpen o = bd_open_type(d, what)?;
+    if (o.type != 0x02) { return Err(invalid_type(what, bs_type_name(o.type))); }
+    return bd_str_body(o.rest, what);
+}
+
+// The string's own bytes, past its type byte.
+Result(Parsed(Str, BsonDec), SerialError) bd_str_body(BsonDec d, Str what) {
+    Parsed(Int, BsonDec) n = bd_i32(d, what)?;
+    Int len = n.value;
+    if (len < 1) { return Err(invalid_length(len, "a BSON string of at least one byte")); }
+    if (!bs_has(n.rest.in, n.rest.pos, len)) { return Err(eof_error(what)); }
+    if (n.rest.in[n.rest.pos + len - 1] != 0) { return Err(syntax_error("a BSON string does not end with a zero byte")); }
+    Str s = bs_str_at(n.rest.in, n.rest.pos, n.rest.pos + len - 1, what)?;
+    return parsed(s, bd_take(n.rest, len));
+}
+
+// Where the open string's content ends, or -1.
+Int bd_str_end(BsonDec d) {
+    Int k = d.open.len();
+    if (k == 0) { return 0 - 1; }
+    BsFrame f = d.open[k - 1];
+    return match f { BsStr(end) => end, BsDoc(_) => 0 - 1, BsBin(_) => 0 - 1 };
+}
+
+Result(Parsed(Int, BsonDec), SerialError) bd_str_begin(BsonDec d) {
+    BsOpen o = bd_open_type(d, "a string")?;
+    if (o.type != 0x02) { return Err(invalid_type("a string", bs_type_name(o.type))); }
+    Parsed(Int, BsonDec) n = bd_i32(o.rest, "a string")?;
+    Int len = n.value;
+    if (len < 1) { return Err(invalid_length(len, "a BSON string of at least one byte")); }
+    if (!bs_has(n.rest.in, n.rest.pos, len)) { return Err(eof_error("a string")); }
+    if (n.rest.in[n.rest.pos + len - 1] != 0) { return Err(syntax_error("a BSON string does not end with a zero byte")); }
+    Int end = n.rest.pos + len - 1;
+    Int chars = bs_cp_count(n.rest.in, n.rest.pos, end, "a string")?;
+    return parsed(chars, bd_push(n.rest, BsStr(end)));
+}
+
+// The next code point of the open string, or -1 at its end.
+Result(Parsed(Int, BsonDec), SerialError) bd_str_next(BsonDec d) {
+    Int end = bd_str_end(d);
+    if (end < 0) { return Err(custom_error("no string is open")); }
+    if (d.pos >= end) {
+        if (d.in[end] != 0) { return Err(syntax_error("a BSON string does not end with a zero byte")); }
+        return parsed(0 - 1, bd_take(bd_pop(d), 1));
+    }
+    BsCp c = bs_cp_at(d.in, d.pos, "a string")?;
+    return parsed(c.cp, bd_take(d, c.next - d.pos));
+}
+
+// Binary: int32 length, a subtype byte, the data.
+Result(Parsed(List(Int), BsonDec), SerialError) bd_bytes(BsonDec d) { return bd_bin_at(d, "bytes"); }
+
+Result(Parsed(List(Int), BsonDec), SerialError) bd_bin_at(BsonDec d, Str what) {
+    BsOpen o = bd_open_type(d, what)?;
+    if (o.type != 0x05) { return Err(invalid_type(what, bs_type_name(o.type))); }
+    return bd_bin_body(o.rest, what);
+}
+
+Result(Parsed(List(Int), BsonDec), SerialError) bd_bin_body(BsonDec d, Str what) {
+    Parsed(Int, BsonDec) n = bd_i32(d, what)?;
+    Int len = n.value;
+    if (len < 0) { return Err(invalid_length(len, "a BSON binary length")); }
+    if (n.rest.pos + 1 > n.rest.in.len()) { return Err(eof_error(what)); }
+    Int sub = n.rest.in[n.rest.pos];
+    if (!bs_has(n.rest.in, n.rest.pos + 1, len)) { return Err(eof_error(what)); }
+    if (sub != 0x00 && sub != 0x02 && sub != 0x04) { return Err(unsupported(f"a BSON binary subtype {sub}")); }
+    List(Int) data = n.rest.in[n.rest.pos + 1..n.rest.pos + 1 + len];
+    return parsed(data, bd_take(n.rest, 1 + len));
+}
+
+Result(Parsed(Int, BsonDec), SerialError) bd_bytes_begin(BsonDec d) {
+    BsOpen o = bd_open_type(d, "bytes")?;
+    if (o.type != 0x05) { return Err(invalid_type("bytes", bs_type_name(o.type))); }
+    Parsed(Int, BsonDec) n = bd_i32(o.rest, "bytes")?;
+    Int len = n.value;
+    if (len < 0) { return Err(invalid_length(len, "a BSON binary length")); }
+    if (n.rest.pos + 1 > n.rest.in.len()) { return Err(eof_error("bytes")); }
+    Int sub = n.rest.in[n.rest.pos];
+    if (sub != 0x00 && sub != 0x02 && sub != 0x04) { return Err(unsupported(f"a BSON binary subtype {sub}")); }
+    if (!bs_has(n.rest.in, n.rest.pos + 1, len)) { return Err(eof_error("bytes")); }
+    return parsed(len, bd_push(bd_take(n.rest, 1), BsBin(n.rest.pos + 1 + len)));
+}
+
+Result(Parsed(Int, BsonDec), SerialError) bd_bytes_next(BsonDec d) {
+    Int k = d.open.len();
+    if (k == 0) { return Err(custom_error("no binary is open")); }
+    BsFrame f = d.open[k - 1];
+    Int end = match f { BsBin(e) => e, BsDoc(_) => 0 - 1, BsStr(_) => 0 - 1 };
+    if (end < 0) { return Err(custom_error("no binary is open")); }
+    if (d.pos >= end) { return parsed(0 - 1, bd_pop(d)); }
+    return parsed(d.in[d.pos], bd_take(d, 1));
+}
+
+// ─── Options ────────────────────────────────────────────────────────
+
+// null is None; anything else is Some, left unread.
+Result(Parsed(Bool, BsonDec), SerialError) bd_option(BsonDec d) {
+    if (d.etype >= 0) { return bd_option_pending(d, bs_is_null(d.etype)); }
+    if (d.pos >= d.in.len()) { return Err(eof_error("an option")); }
+    Int t = d.in[d.pos];
+    if (bs_is_null(t)) { return parsed(false, bd_take(d, 1)); }
+    return parsed(true, d);
+}
+
+Bool bs_is_null(Int t) { return t == 0x0A || t == 0x06; }
+
+// None takes the element's type with it; Some leaves it for the value.
+Result(Parsed(Bool, BsonDec), SerialError) bd_option_pending(BsonDec d, Bool is_null) {
+    if (is_null) { return parsed(false, bd_pending(d, 0 - 1)); }
+    return parsed(true, d);
+}
+
+// ─── Documents, sequences and maps ──────────────────────────────────
+
+Result(Parsed(Int, BsonDec), SerialError) bd_seq_begin(BsonDec d) { return bd_container_begin(d, 0x04, "a sequence"); }
+
+Result(Parsed(Bool, BsonDec), SerialError) bd_seq_next(BsonDec d) { return bd_elem_next(d, "an array element name"); }
+
+Result(Parsed(Int, BsonDec), SerialError) bd_map_begin(BsonDec d) { return bd_container_begin(d, 0x03, "a map"); }
+
+Result(Parsed(Bool, BsonDec), SerialError) bd_map_next(BsonDec d) { return bd_map_elem_next(d); }
+
+// A map's next entry: the type of its value, then its name, which is the
+// key. The key is read next, so the name waits for it.
+Result(Parsed(Bool, BsonDec), SerialError) bd_map_elem_next(BsonDec d) {
+    Int end = bd_doc_end(d);
+    if (end < 0) { return Err(custom_error("no document is open")); }
+    if (d.pos >= end) {
+        if (d.in[end] != 0) { return Err(syntax_error("a BSON document does not end with a zero byte")); }
+        return parsed(false, bd_take(bd_pop(d), 1));
+    }
+    BsOpen o = bd_open_type(d, "a map key")?;
+    BsonDec d1 = bd_mkey(o.rest, o.type);
+    return parsed(true, d1);
+}
+
+// The key is the element name, which was read with it.
+Result(BsonDec, SerialError) bd_map_value(BsonDec d) { return Ok(d); }
+
+Result(BsonDec, SerialError) bd_struct_begin(BsonDec d, Str name, List(Str) fields) { return bd_doc_head(d, 0x03, "a struct"); }
+
+// A container states no count of its own, so its elements are counted by
+// walking them before the first one is read.
+Result(Parsed(Int, BsonDec), SerialError) bd_container_begin(BsonDec d, Int type, Str what) {
+    BsonDec d1 = bd_doc_head(d, type, what)?;
+    return parsed(bd_count(d1, what)?, d1);
+}
+
+// A document or array: its length, and the frame that ends where its zero
+// byte is. An element states its type in front of its name, but a document
+// at the top of a stream is a length and nothing else, so the type is only
+// there to check.
+Result(BsonDec, SerialError) bd_doc_head(BsonDec d, Int type, Str what) {
+    if (d.etype >= 0) {
+        BsOpen o = bd_open_type(d, what)?;
+        if (o.type != type) { return Err(invalid_type(what, bs_type_name(o.type))); }
+        return bd_doc_open(o.rest, what);
+    }
+    return bd_doc_open(d, what);
+}
+
+// The length a document header already consumed, and its frame.
+Result(BsonDec, SerialError) bd_doc_open(BsonDec d, Str what) {
+    Int p = d.pos;
+    Parsed(Int, BsonDec) n = bd_i32(d, what)?;
+    Int len = n.value;
+    if (len < 5) { return Err(invalid_length(len, "a BSON document of at least 5 byte(s)")); }
+    Int end = p + len - 1;
+    if (end >= n.rest.in.len()) { return Err(eof_error(what)); }
+    if (n.rest.in[end] != 0) { return Err(syntax_error("a BSON document does not end with a zero byte")); }
+    return Ok(bd_push(n.rest, BsDoc(end)));
+}
+
+// The next element of the open document: its type byte and name read, with
+// the type left for the value. The document's zero byte ends the walk.
+Result(Parsed(Bool, BsonDec), SerialError) bd_elem_next(BsonDec d, Str what) {
+    Int end = bd_doc_end(d);
+    if (end < 0) { return Err(custom_error("no document is open")); }
+    if (d.pos >= end) {
+        if (d.in[end] != 0) { return Err(syntax_error("a BSON document does not end with a zero byte")); }
+        return parsed(false, bd_take(bd_pop(d), 1));
+    }
+    BsElemHead h = bd_elem(d, what)?;
+    return parsed(true, bd_pending(h.rest_state, h.type));
+}
+
+// The next field: its name, matched against the names the type knows.
+Result(Parsed(FieldKey, BsonDec), SerialError) bd_field(BsonDec d, List(Str) fields) {
+    Int end = bd_doc_end(d);
+    if (end < 0) { return Err(custom_error("no document is open")); }
+    if (d.pos >= end) {
+        if (d.in[end] != 0) { return Err(syntax_error("a BSON document does not end with a zero byte")); }
+        return parsed(EndOfFields, bd_take(bd_pop(d), 1));
+    }
+    BsElemHead h = bd_elem(d, "a field name")?;
+    Int idx = name_index(fields, h.name);
+    FieldKey key = if (idx < 0) { UnknownField(h.name) } else { KnownField(idx) };
+    return parsed(key, bd_pending(h.rest_state, h.type));
+}
+
+// How many elements the open document holds, found without changing the
+// state the elements themselves will be read from.
+Result(Int, SerialError) bd_count(BsonDec d, Str what) { return bd_count_at(d, bd_doc_end(d), what, 0); }
+
+Result(Int, SerialError) bd_count_at(BsonDec d, Int end, Str what, Int n) {
+    if (end < 0) { return Err(custom_error("no document is open")); }
+    if (d.pos >= end) { return Ok(n); }
+    Int t = bd_type_int(d, what)?;
+    BsonDec d1 = bd_cstring_to(bd_take(d, 1), "an element name");
+    BsonDec after = bd_skip_value(t, d1, what)?;
+    return bd_count_at(after, end, what, n + 1);
+}
+
+// ─── Variants ───────────────────────────────────────────────────────
+
+// A unit variant is a string; a variant with a payload is a one-entry
+// document keyed by the variant's name. Either way only the name is read.
+Result(Parsed(Str, BsonDec), SerialError) bd_variant_name_at(BsonDec d) {
+    if (d.etype < 0) { return bd_variant_bare(d); }
+    BsOpen o = bd_open_type(d, "an enum variant")?;
+    if (o.type == 0x02) { return bd_cstring(o.rest, "a variant name"); }
+    if (o.type != 0x03) { return Err(invalid_type("an enum variant", bs_type_name(o.type))); }
+    return bd_variant_doc(o.rest);
+}
+
+// A bare variant at the top of a stream is a string for a unit variant and
+// a document for one with a payload. A document's length is at least five
+// and a string's type byte is 2, so the first byte tells them apart.
+Result(Parsed(Str, BsonDec), SerialError) bd_variant_bare(BsonDec d) {
+    Int t = bd_type_int(d, "an enum variant")?;
+    if (t == 0x02) { return bd_str_body(bd_take(d, 1), "a variant name"); }
+    return bd_variant_doc(d);
+}
+
+// A variant's document: the one-entry document keyed by the variant's name.
+Result(Parsed(Str, BsonDec), SerialError) bd_variant_doc(BsonDec d) {
+    BsonDec d1 = bd_doc_open(d, "an enum variant")?;
+    BsElemHead h = bd_elem(d1, "a variant name")?;
+    if (h.name == "") { return Err(syntax_error("a variant document has no name")); }
+    BsonDec d2 = bd_pending(bd_payloads(h.rest_state, d1.payloads + 1), h.type);
+    return parsed(h.name, bd_vmaps(d2, d2.vmaps + 1));
+}
+
+Result(Parsed(Int, BsonDec), SerialError) bd_variant(BsonDec d, Str enum_name, List(Str) variants) {
+    Result(Parsed(Str, BsonDec), SerialError) n = bd_variant_name_at(d);
+    if (Err(e) = n) { return Err(e); }
+    return match n { Ok(x) => bd_variant_idx(x, variants), Err(_) => Err(custom_error("unreachable")) };
+}
+
+Result(Parsed(Int, BsonDec), SerialError) bd_variant_idx(Parsed(Str, BsonDec) n, List(Str) variants) {
+    Int idx = name_index(variants, n.value);
+    if (idx < 0) { return Err(unknown_variant(n.value, variants)); }
+    return parsed(idx, n.rest);
+}
+
+Result(Parsed(VariantName, BsonDec), SerialError) bd_variant_name(BsonDec d) {
+    Result(Parsed(Str, BsonDec), SerialError) n = bd_variant_name_at(d);
+    if (Err(e) = n) { return Err(e); }
+    return match n {
+        Ok(x) => parsed(VariantName {.enum_name = "", .index = 0 - 1, .name = x.value, .has_payload = x.rest.payloads > 0}, x.rest),
+        Err(_) => Err(custom_error("unreachable"))
+    };
+}
+
+Result(BsonDec, SerialError) bd_variant_payload(BsonDec d) {
+    if (d.payloads < 1) { return Err(custom_error("read_variant_payload without a payload")); }
+    return Ok(bd_payloads(d, d.payloads - 1));
+}
+
+Result(BsonDec, SerialError) bd_variant_unit(BsonDec d) {
+    if (d.payloads > 0) { return Err(custom_error("read_variant_unit on a variant with a payload")); }
+    return Ok(bd_pending(d, 0 - 1));
+}
+
+// Close a variant's document: it held the name and the payload, nothing
+// else.
+Result(BsonDec, SerialError) bd_variant_end(BsonDec d) {
+    if (d.payloads > 0) { return Err(custom_error("read_variant_end before the payload")); }
+    if (d.vmaps < 1) { return Ok(d); }
+    Int end = bd_doc_end(d);
+    if (end < 0) { return Err(custom_error("read_variant_end without a variant document")); }
+    if (d.pos != end) { return Err(syntax_error("a variant document has more than one entry")); }
+    return Ok(bd_vmaps(bd_take(bd_pop(d), 1), d.vmaps - 1));
+}
+
+// ─── Untyped reads ──────────────────────────────────────────────────
+
+// What comes next, read without consuming: the shape a self-describing
+// format owes its reader.
+Result(Parsed(Peek, BsonDec), SerialError) bd_peek(BsonDec d) {
+    if (d.mkey) { return parsed(PeekStr, d); }
+    if (d.etype >= 0) { return parsed(bs_peek_kind(d, d.etype), d); }
+    if (bd_whole_doc(d)) { return parsed(if (bd_whole_seq(d)) { PeekSeq } else { PeekMap }, d); }
+    return parsed(bs_peek_kind(d, bd_type_of(d, "a value")?), d);
+}
+
+// A document at the top of a stream has no type byte in front of it: it is
+// a length, its elements, and a zero byte. A bare value starts with a type
+// byte instead, so the two are told apart by whether the bytes ahead are a
+// document that fills the message: a length that reaches the end, a zero
+// byte where it says, and, if it has one, an element of a type this format
+// knows. A nested container is never in this position, since read_field
+// and read_seq_next leave the element's type behind.
+Bool bd_whole_doc(BsonDec d) {
+    if (!bs_has(d.in, d.pos, 5)) { return false; }
+    Int len = bs_read_signed(d.in, d.pos, 4);
+    if (d.pos + len != d.in.len()) { return false; }
+    if (d.in[d.pos + len - 1] != 0) { return false; }
+    if (len == 5) { return true; }
+    return bs_known_type(d.in[d.pos + 4]);
+}
+
+// An array is a document whose elements are named by their index, so the
+// first name is what tells the two apart.
+Bool bd_whole_seq(BsonDec d) {
+    if (!bs_has(d.in, d.pos, 7)) { return false; }
+    Int len = bs_read_signed(d.in, d.pos, 4);
+    if (len < 7) { return false; }
+    if (d.in[d.pos + 4] != 0x10 && d.in[d.pos + 4] != 0x12) { return false; }
+    return d.in[d.pos + 5] == 48 && d.in[d.pos + 6] == 0;
+}
+
+// The element types this format reads.
+Bool bs_known_type(Int t) {
+    return t == 0x01 || t == 0x02 || t == 0x03 || t == 0x04 || t == 0x05 || t == 0x06 || t == 0x08
+        || t == 0x09 || t == 0x0A || t == 0x0B || t == 0x0D || t == 0x0F || t == 0x10 || t == 0x11
+        || t == 0x12 || t == 0x13;
+}
+
+// The type of the value that comes next, without consuming it: the
+// element's own, or the byte at the read position.
+Result(Int, SerialError) bd_type_of(BsonDec d, Str what) {
+    if (d.etype >= 0) { return Ok(d.etype); }
+    return bd_type_int(d, what);
+}
+
+// A tag decides: 0x13 is a decimal128, whose sign nibble separates the two
+// 128-bit widths.
+Peek bs_peek_kind(BsonDec d, Int t) {
+    if (t == 0x01) { return PeekFloat; }
+    if (t == 0x02) { return PeekStr; }
+    if (t == 0x03) { return PeekMap; }
+    if (t == 0x04) { return PeekSeq; }
+    if (t == 0x05) { return PeekBytes; }
+    if (t == 0x06 || t == 0x0A) { return PeekNone; }
+    if (t == 0x08) { return PeekBool; }
+    if (t == 0x10 || t == 0x12) { return if (bs_peek_negative(d)) { PeekInt } else { PeekUInt }; }
+    if (t == 0x13) { return if (bs_dec_peek_neg(d)) { PeekI128 } else { PeekU128 }; }
+    return PeekInt;
+}
+
+// Whether the integer that follows is negative, without reading it.
+Bool bs_peek_negative(BsonDec d) {
+    Int size = bs_int_size(d);
+    return bs_high_bit(d.in, d.pos + bs_body_at(d), size);
+}
+
+// How wide the integer that follows is, in bytes.
+Int bs_int_size(BsonDec d) {
+    if (bs_type_at(d) == 0x10) { return 4; }
+    return 8;
+}
+
+// The element's type when one is waiting, else the byte at the read
+// position: a bare value carries its own, an element's was read with its
+// name.
+Int bs_type_at(BsonDec d) {
+    if (d.etype >= 0) { return d.etype; }
+    if (d.pos >= d.in.len()) { return 0x01; }
+    return d.in[d.pos];
+}
+
+// Where a bare value's payload starts, one byte past its type.
+Int bs_body_at(BsonDec d) { return if (d.etype >= 0) { 0 } else { 1 }; }
+
+Bool bs_high_bit(List(Int) bs, Int i, Int n) {
+    if (!bs_has(bs, i, n)) { return false; }
+    return bs[i + n - 1] >= 128;
+}
+
+Bool bs_dec_peek_neg(BsonDec d) {
+    if (!bs_has(d.in, d.pos + bs_body_at(d), 16)) { return false; }
+    return d.in[d.pos + bs_body_at(d) + 15] >> 4 == 8;
+}
+
+// Skip one value of any type, read with the same head rules.
+Result(BsonDec, SerialError) bd_skip(BsonDec d) { return bd_skip_at(d, "a value"); }
+
+Result(BsonDec, SerialError) bd_skip_at(BsonDec d, Str what) {
+    BsOpen o = bd_open_type(d, what)?;
+    return bd_skip_value(o.type, o.rest, what);
+}
+
+Result(BsonDec, SerialError) bd_skip_value(Int t, BsonDec d, Str what) {
+    if (t == 0x02) { return bd_skip_string(d, what); }
+    if (t == 0x03 || t == 0x04) { return bd_skip_doc(d, what); }
+    if (t == 0x05) { return bd_skip_bin(d, what); }
+    if (t == 0x01) { return bd_skip_n(d, 8, what); }
+    if (t == 0x08) { return bd_skip_n(d, 1, what); }
+    if (t == 0x10) { return bd_skip_n(d, 4, what); }
+    if (t == 0x12) { return bd_skip_n(d, 8, what); }
+    if (t == 0x13) { return bd_skip_n(d, 16, what); }
+    if (t == 0x06 || t == 0x0A) { return Ok(d); }
+    return Err(unsupported(bs_type_name(t)));
+}
+
+Result(BsonDec, SerialError) bd_skip_n(BsonDec d, Int n, Str what) {
+    if (!bs_has(d.in, d.pos, n)) { return Err(eof_error(what)); }
+    return Ok(bd_take(d, n));
+}
+
+Result(BsonDec, SerialError) bd_skip_string(BsonDec d, Str what) {
+    Parsed(Int, BsonDec) n = bd_i32(d, what)?;
+    Int len = n.value;
+    if (len < 1) { return Err(invalid_length(len, "a BSON string of at least one byte")); }
+    if (!bs_has(n.rest.in, n.rest.pos, len)) { return Err(eof_error(what)); }
+    return Ok(bd_take(n.rest, len));
+}
+
+Result(BsonDec, SerialError) bd_skip_bin(BsonDec d, Str what) {
+    Parsed(Int, BsonDec) n = bd_i32(d, what)?;
+    Int len = n.value;
+    if (len < 0) { return Err(invalid_length(len, "a BSON binary length")); }
+    if (!bs_has(n.rest.in, n.rest.pos + 1, len)) { return Err(eof_error(what)); }
+    return Ok(bd_take(n.rest, 1 + len));
+}
+
+Result(BsonDec, SerialError) bd_skip_doc(BsonDec d, Str what) {
+    Int p = d.pos;
+    Parsed(Int, BsonDec) n = bd_i32(d, what)?;
+    Int len = n.value;
+    if (len < 5) { return Err(invalid_length(len, "a BSON document of at least 5 byte(s)")); }
+    Int end = p + len - 1;
+    if (end >= n.rest.in.len()) { return Err(eof_error(what)); }
+    if (n.rest.in[end] != 0) { return Err(syntax_error("a BSON document does not end with a zero byte")); }
+    return Ok(bd_take(n.rest, end + 1 - n.rest.pos));
+}
+
+Result(BsonDec, SerialError) bd_end(BsonDec d) {
+    if (d.pos < d.in.len()) { return Err(trailing_input(f"{d.in.len() - d.pos} byte(s)")); }
+    return Ok(d);
+}
+
+Bool bd_human(BsonDec d) { return false; }
+
+Decoder(BsonDec) = {
+    .read_unit = bd_unit, .read_bool = bd_bool, .read_int = bd_int, .read_uint = bd_uint,
+    .read_i128 = bd_i128, .read_u128 = bd_u128,
+    .read_float = bd_float, .read_str = bd_str, .read_bytes = bd_bytes, .read_option = bd_option,
+    .read_str_begin = bd_str_begin, .read_str_next = bd_str_next,
+    .read_bytes_begin = bd_bytes_begin, .read_bytes_next = bd_bytes_next,
+    .read_seq_begin = bd_seq_begin, .read_seq_next = bd_seq_next, .read_map_begin = bd_map_begin,
+    .read_map_next = bd_map_next, .read_map_value = bd_map_value, .read_struct_begin = bd_struct_begin,
+    .read_field = bd_field, .read_variant = bd_variant, .read_variant_name = bd_variant_name,
+    .read_variant_unit = bd_variant_unit, .read_variant_payload = bd_variant_payload,
+    .read_variant_end = bd_variant_end, .read_skip = bd_skip, .read_peek = bd_peek, .read_end = bd_end,
+    .decodes_human_readable = bd_human
+};
+
+// ─── Entry points ────────────────────────────────────────────────────
+
+@needs(Decode(T, BsonDec))
+pub Result(T, SerialError) from_bson(List(Int) bs) { return decode_value(bson_decoder(bs)); }
+
+@needs(Decode(T, BsonDec))
+pub Result(T, SerialError) from_bson_hex(Str hex) {
+    Result(List(Int), SerialError) r = bs_unhex(hex);
+    if (Err(e) = r) { return Err(e); }
+    return match r { Ok(bs) => from_bson(bs), Err(e2) => Err(e2) };
+}

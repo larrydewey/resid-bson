@@ -1,0 +1,272 @@
+// bits.resid — the byte-level pieces BSON needs: little-endian integers,
+// IEEE-754 doubles, decimal128, UTF-8 and hex.
+//
+// Everything here is wire order. BSON is little-endian throughout, so an
+// integer is written least significant byte first, and a double is the
+// IEEE-754 bit pattern reversed from the big-endian form.
+
+import "../../resid-serial/src/serial.resid";
+
+// ─── Little-endian integers ─────────────────────────────────────────
+
+// The low `n` bytes of v, least significant first.
+pub List(Int) bs_le(UInt(64) v, Int n) { return bs_le_at(v, n, 0, []); }
+
+pub List(Int) bs_le_at(UInt(64) v, Int n, Int i, List(Int) acc) {
+    if (i >= n) { return acc; }
+    return bs_le_at(v, n, i + 1, acc.concat([(Int)((v >> (8 * i)) & u64(255))]));
+}
+
+// A signed 32-bit integer: the low four bytes of the two's complement, so a
+// negative value is written from its unsigned pattern.
+pub List(Int) bs_i4(Int v) { return bs_le(wrapping_u64(v), 4); }
+pub List(Int) bs_i8(Int v) { return bs_le(wrapping_u64(v), 8); }
+
+// `n` bytes of v, least significant first.
+// Least significant byte first, so the first byte read is the low one.
+pub UInt(64) bs_read_le(List(Int) bs, Int i, Int n) { return bs_read_le_at(bs, i, n, 0, u64(0)); }
+
+pub UInt(64) bs_read_le_at(List(Int) bs, Int i, Int n, Int k, UInt(64) acc) {
+    if (k >= n) { return acc; }
+    return bs_read_le_at(bs, i, n, k + 1, acc | ((UInt(64))bs[i + k] << (8 * k)));
+}
+
+// A little-endian integer as a signed value: the top bit of the last byte
+// sign-extends it.
+pub Int bs_read_signed(List(Int) bs, Int i, Int n) {
+    UInt(64) raw = bs_read_le(bs, i, n);
+    UInt(64) sign = u64(1) << (8 * n - 1);
+    if ((raw & sign) == sign) { return 0 - (Int)((sign - u64(1)) - (raw & (sign - u64(1)))) - 1; }
+    return (Int)raw;
+}
+
+pub Bool bs_has(List(Int) bs, Int i, Int n) { return i >= 0 && n >= 0 && i + n <= bs.len(); }
+
+// ─── UTF-8 ───────────────────────────────────────────────────────────
+
+pub List(Int) bs_cp_bytes(Int cp) {
+    Int w = utf8_width(cp);
+    if (w == 1) { return [cp]; }
+    if (w == 2) { return [192 + (cp >> 6), 128 + (cp & 63)]; }
+    if (w == 3) { return [224 + (cp >> 12), 128 + ((cp >> 6) & 63), 128 + (cp & 63)]; }
+    return [240 + (cp >> 18), 128 + ((cp >> 12) & 63), 128 + ((cp >> 6) & 63), 128 + (cp & 63)];
+}
+
+pub List(Int) bs_str_bytes(Str s) { return bs_str_bytes_at(s, 0, []); }
+
+pub List(Int) bs_str_bytes_at(Str s, Int i, List(Int) acc) {
+    if (i >= str_len(s)) { return acc; }
+    return bs_str_bytes_at(s, i + 1, acc.concat(bs_cp_bytes(str_char_at(s, i))));
+}
+
+type BsCp = { Int cp; Int next; };
+
+pub Result(BsCp, SerialError) bs_cp_at(List(Int) bs, Int i, Str what) {
+    if (i >= bs.len()) { return Err(eof_error(what)); }
+    Int b0 = bs[i];
+    if (b0 < 128) { return Ok(BsCp {.cp = b0, .next = i + 1}); }
+    if (b0 < 192) { return Err(syntax_error(f"invalid UTF-8 in {what}: a continuation byte starts it")); }
+    Int extra = if (b0 < 224) { 1 } else { if (b0 < 240) { 2 } else { 3 } };
+    if (i + extra >= bs.len()) { return Err(eof_error(what)); }
+    Int head = if (extra == 1) { b0 - 192 } else { if (extra == 2) { b0 - 224 } else { b0 - 240 } };
+    return bs_cp_cont(bs, i, extra, 0, head, what);
+}
+
+pub Result(BsCp, SerialError) bs_cp_cont(List(Int) bs, Int i, Int extra, Int k, Int cp, Str what) {
+    if (k >= extra) { return Ok(BsCp {.cp = cp, .next = i + 1 + extra}); }
+    Int b = bs[i + 1 + k];
+    if (b < 128 || b > 191) { return Err(syntax_error(f"invalid UTF-8 in {what}")); }
+    return bs_cp_cont(bs, i, extra, k + 1, (cp << 6) | (b & 63), what);
+}
+
+pub Result(Str, SerialError) bs_str_at(List(Int) bs, Int i, Int end, Str what) { return bs_str_at_buf(bs, i, end, StrBuf(), what); }
+
+pub Result(Str, SerialError) bs_str_at_buf(List(Int) bs, Int i, Int end, StrBuf b, Str what) {
+    if (i >= end) { return Ok(b.finish()); }
+    Result(BsCp, SerialError) r = bs_cp_at(bs, i, what);
+    if (Err(e) = r) { Str dropped = b.finish(); return Err(e); }
+    if (Ok(c) = r) { return bs_str_at_buf(bs, c.next, end, b.push_char(c.cp), what); }
+    Str dropped2 = b.finish();
+    return Err(custom_error("unreachable"));
+}
+
+pub Result(Int, SerialError) bs_cp_count(List(Int) bs, Int i, Int end, Str what) { return bs_cp_count_at(bs, i, end, 0, what); }
+
+pub Result(Int, SerialError) bs_cp_count_at(List(Int) bs, Int i, Int end, Int acc, Str what) {
+    if (i >= end) { return Ok(acc); }
+    Result(BsCp, SerialError) r = bs_cp_at(bs, i, what);
+    if (Err(e) = r) { return Err(e); }
+    if (Ok(c) = r) { return bs_cp_count_at(bs, c.next, end, acc + 1, what); }
+    return Err(custom_error("unreachable"));
+}
+
+// ─── IEEE-754 doubles ────────────────────────────────────────────────
+//
+// Resid has no float-to-bits builtin, so the bit pattern is built from the
+// value's own arithmetic: scale into [1, 2) for the exponent field and shift
+// the fraction out a bit at a time, which is exact for a value that is
+// already a binary floating-point number.
+
+pub Float bs_pow2(Int n) {
+    if (n >= 0) { return bs_pow2_up(n, 1.0); }
+    return bs_pow2_down(0 - n, 1.0);
+}
+
+pub Float bs_pow2_up(Int n, Float acc) {
+    if (n <= 0) { return acc; }
+    return bs_pow2_up(n - 1, acc * 2.0);
+}
+
+pub Float bs_pow2_down(Int n, Float acc) {
+    if (n <= 0) { return acc; }
+    return bs_pow2_down(n - 1, acc / 2.0);
+}
+
+pub Bool bs_is_neg(Float v) { return v < 0.0 || (v == 0.0 && 1.0 / v < 0.0); }
+
+pub Int bs_exp(Float a) {
+    if (a < 1.0) { return bs_exp_down(a, 0); }
+    return bs_exp_up(a, 0);
+}
+
+pub Int bs_exp_up(Float x, Int e) {
+    if (x >= 2.0) { return bs_exp_up(x / 2.0, e + 1); }
+    return e;
+}
+
+pub Int bs_exp_down(Float x, Int e) {
+    if (x < 1.0) { return bs_exp_down(x * 2.0, e - 1); }
+    return e;
+}
+
+pub UInt(64) bs_frac_bits(Float m, Int width) { return bs_frac_at(m, width, u64(0)); }
+
+pub UInt(64) bs_frac_at(Float m, Int left, UInt(64) acc) {
+    if (left <= 0) { return acc; }
+    Float x = m * 2.0;
+    if (x >= 1.0) { return bs_frac_at(x - 1.0, left - 1, acc * u64(2) + u64(1)); }
+    return bs_frac_at(x, left - 1, acc * u64(2));
+}
+
+// A double as eight little-endian bytes.
+pub List(Int) bs_f64_bits(Float v) {
+    Float a = if (bs_is_neg(v)) { 0.0 - v } else { v };
+    if (a == 0.0) { return bs_le(bs_sign_bits(bs_is_neg(v)), 8); }
+    Int e = bs_exp(a);
+    UInt(64) raw = ((UInt(64))(e + 1023) << 52) | bs_frac_bits(a / bs_pow2(e) - 1.0, 52);
+    return bs_le(raw | bs_sign_bits(bs_is_neg(v)), 8);
+}
+
+pub UInt(64) bs_sign_bits(Bool neg) { return if (neg) { u64(0x8000000000000000) } else { u64(0) }; }
+
+pub Float bs_f64_from(List(Int) bs, Int i) {
+    Float sign = if (bs[i + 7] >= 128) { -1.0 } else { 1.0 };
+    Int e = ((bs[i + 7] & 0x7F) << 4) | (bs[i + 6] >> 4);
+    Int m = ((bs[i + 6] & 0x0F) << 48) | (bs[i + 5] << 40) | (bs[i + 4] << 32) | (bs[i + 3] << 24) | (bs[i + 2] << 16) | (bs[i + 1] << 8) | bs[i];
+    if (e == 0) { return sign * (Float)m * bs_pow2(0 - 1074); }
+    if (e == 2047) { return if (m == 0) { bs_inf(sign) } else { bs_nan() }; }
+    return sign * (1.0 + (Float)m * bs_pow2(0 - 52)) * bs_pow2(e - 1023);
+}
+
+pub Float bs_inf(Float sign) { Float z = 0.0; return sign * (1.0 / z); }
+
+pub Float bs_nan() { Float z = 0.0; return z / z; }
+
+// ─── decimal128 ──────────────────────────────────────────────────────
+//
+// Sixteen little-endian bytes whose top nibble is the sign: 0b0000
+// positive, 0b1000 negative, 0b1100 NaN. That leaves 124 bits of magnitude,
+// so |v| must fit in 2^124 - 1.
+
+pub Int bs_dec128() { return 0x13; }
+
+// The magnitude of a 128-bit value, as an unsigned 128-bit integer.
+pub UInt(128) bs_mag128(Int(128) v) {
+    if (v < i128(0)) { return bs_mag_neg128(v); }
+    return u128(v);
+}
+
+// -v for a negative 128-bit value, with -2^127 spelled out since it has no
+// positive counterpart.
+pub UInt(128) bs_mag_neg128(Int(128) v) {
+    if (v == i128(0) - i128(170141183460469231731687303715884105727) - i128(1)) { return u128(170141183460469231731687303715884105727) + u128(1); }
+    return u128(i128(0) - v);
+}
+
+// Sixteen little-endian bytes of the magnitude, with the sign in the top
+// nibble of the last one.
+pub List(Int) bs_dec128_bytes(UInt(128) mag, Bool neg) {
+    List(Int) bs = bs_dec128_at(mag, 16, []);
+    Int last = bs[15] & 0x0F;
+    return bs[0..15].concat([if (neg) { last | 0x80 } else { last }]);
+}
+
+pub List(Int) bs_dec128_at(UInt(128) mag, Int n, List(Int) acc) {
+    if (n <= 0) { return acc; }
+    return bs_dec128_at(mag >> 8, n - 1, acc.concat([(Int)(mag & u128(255))]));
+}
+
+// The signed value of a decimal128's sixteen bytes, and whether the sign
+// nibble is one this package can hold.
+pub Result(Int(128), SerialError) bs_dec128_from(List(Int) bs, Int i) {
+    Int sign = bs[i + 15] >> 4;
+    List(Int) low = bs[i..i + 16];
+    List(Int) cleared = bs_clear_top(low);
+    UInt(128) mag = bs_be128(cleared, 0, 0, u128(0));
+    if (sign == 0) { return Ok((Int(128))mag); }
+    if (sign == 8) { return Ok(i128(0) - (Int(128))mag); }
+    if (sign == 12) { return Err(invalid_value("a decimal128 NaN", "a finite value")); }
+    return Err(invalid_value(f"a decimal128 with sign nibble {sign}", "0 or 8"));
+}
+
+pub List(Int) bs_clear_top(List(Int) bs) { return bs_clear_top_at(bs, 0, []); }
+
+pub List(Int) bs_clear_top_at(List(Int) bs, Int i, List(Int) acc) {
+    if (i >= bs.len()) { return acc; }
+    Int b = if (i == 15) { bs[i] & 0x0F } else { bs[i] };
+    return bs_clear_top_at(bs, i + 1, acc.concat([b]));
+}
+
+// Sixteen little-endian bytes as an unsigned 128-bit integer: four 32-bit
+// groups, least significant first.
+pub UInt(128) bs_be128(List(Int) bs, Int i, Int n, UInt(128) acc) {
+    if (n >= 4) { return acc; }
+    UInt(64) g = (UInt(64))bs[i + 4 * n] | ((UInt(64))bs[i + 4 * n + 1] << 8) | ((UInt(64))bs[i + 4 * n + 2] << 16) | ((UInt(64))bs[i + 4 * n + 3] << 24);
+    return bs_be128(bs, i, n + 1, acc | (u128(g) << (32 * n)));
+}
+
+// 2^124 - 1, the largest magnitude a decimal128 can hold.
+pub UInt(128) bs_dec128_max() { return (u128(1) << 124) - u128(1); }
+
+// ─── Hex ─────────────────────────────────────────────────────────────
+
+pub Str bs_hex(List(Int) bs) { return bs_hex_at(bs, 0, StrBuf()); }
+
+// The hex text, two digits per byte, gathered in one builder.
+pub Str bs_hex_at(List(Int) bs, Int i, StrBuf b) {
+    if (i >= bs.len()) { return b.finish(); }
+    StrBuf more = b.push(bs_hex_digit(bs[i] >> 4)).push(bs_hex_digit(bs[i] & 15));
+    return bs_hex_at(bs, i + 1, more);
+}
+
+pub Str bs_hex_digit(Int n) { return str_slice("0123456789abcdef", n, n + 1); }
+
+pub Result(List(Int), SerialError) bs_unhex(Str h) { return bs_unhex_at(h, 0, ListBuf()); }
+
+pub Result(List(Int), SerialError) bs_unhex_at(Str h, Int i, ListBuf(Int) b) {
+    if (i >= str_len(h)) { return Ok(b.finish()); }
+    Int hi = bs_hex_nibble(h, i);
+    if (hi < 0) { List(Int) dropped = b.finish(); return Err(syntax_error(f"invalid hex digit in \"{h}\"")); }
+    Int lo = bs_hex_nibble(h, i + 1);
+    if (lo < 0) { List(Int) dropped2 = b.finish(); return Err(syntax_error(f"invalid hex digit in \"{h}\"")); }
+    return bs_unhex_at(h, i + 2, b.push(hi * 16 + lo));
+}
+
+pub Int bs_hex_nibble(Str h, Int i) {
+    if (i >= str_len(h)) { return -1; }
+    Int c = str_char_at(h, i);
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}

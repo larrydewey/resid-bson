@@ -1,0 +1,96 @@
+// value.resid — the format-neutral Value tree over CBOR. Decoding a Value
+// asks the format what comes next (read_peek) and skips what it does not
+// know (read_skip), so this is where the self-describing side of the
+// decoder is exercised.
+
+import "../src/bson.resid";
+import "../../resid-serial/src/value.resid";
+import "check.resid";
+
+// Decode, show, and write it back out again: the same hex means the two
+// directions agree.
+Str trip(Str hex) {
+    Result(Value, SerialError) r = from_bson_hex(hex);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return show_value(v); }
+    return "unreachable";
+}
+
+Str again(Str hex) {
+    Result(Value, SerialError) r = from_bson_hex(hex);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return hex_text_of(to_bson_hex(v)); }
+    return "unreachable";
+}
+
+// A Value built in code, encoded, decoded and encoded again: the same
+// bytes both ways. A struct and a map are the same thing on the wire, and
+// so are a variant and its payload, so what is compared is the encoding.
+Bool wire(Str name, Value want) {
+    Result(Str, SerialError) hex = to_bson_hex(want);
+    if (Err(e) = hex) { return check_text(name, "encode: " + error_text(e), "ok"); }
+    return wire_again(name, hex, want);
+}
+
+Bool wire_again(Str name, Result(Str, SerialError) hex, Value want) {
+    if (Ok(text) = hex) {
+        Result(Value, SerialError) r = from_bson_hex(text);
+        if (Err(e) = r) { return check_text(name, "decode: " + error_text(e), text); }
+        if (Ok(got) = r) { return check_text(name, hex_text_of(to_bson_hex(got)), text); }
+    }
+    return check_text(name, "unreachable", show_value(want));
+}
+
+Int main() {
+    // What each kind reads as. A bare value at the top of a stream states
+    // its own type byte, and a document is a length, its elements, and a
+    // zero byte.
+    check_text("peek/int", trip("1005000000"), "5u");
+    check_text("peek/negative", trip("10ffffffff"), "-1");
+    check_text("peek/big uint", trip("120001000000000000"), "256u");
+    check_text("peek/bool", trip("0801"), "true");
+    check_text("peek/null", trip("0a"), "None");
+    check_text("peek/float", trip("01000000000000f83f"), "1.5");
+    check_text("peek/string", trip("020400000061626300"), "\"abc\"");
+    check_text("peek/bytes", trip("050300000000010203"), "b[1, 2, 3]");
+    check_text("peek/array", trip("1a00000010300001000000103100020000001032000300000000"), "[1u, 2u, 3u]");
+    check_text("peek/map", trip("13000000106100010000001062000200000000"), "{\"a\": 1u, \"b\": 2u}");
+    check_text("peek/decimal128", trip("13ffffffffffffffffffffffffffffff0f"),
+        "21267647932558653966460912964485513215u128");
+    check_text("peek/variant text", trip("0204000000446f7400"), "\"Dot\"");
+    check_text("peek/variant document", trip("1100000010436972636c65000100000000"), "{\"Circle\": 1u}");
+    check_text("peek/nested", trip("1b0000001230000001000000000000023100040000006162630000"), "[256u, \"abc\"]");
+
+    // Written back out, the same bytes.
+    check_text("again/array", again("1a00000010300001000000103100020000001032000300000000"),
+        "1a00000010300001000000103100020000001032000300000000");
+    check_text("again/map", again("13000000106100010000001062000200000000"),
+        "13000000106100010000001062000200000000");
+    check_text("again/variant", again("1100000010436972636c65000100000000"), "1100000010436972636c65000100000000");
+    check_text("again/decimal128", again("13ffffffffffffffffffffffffffffff0f"), "13ffffffffffffffffffffffffffffff0f");
+    check_text("again/float", again("019a9999999999b93f"), "019a9999999999b93f");
+    check_text("again/bytes", again("050300000000010203"), "050300000000010203");
+
+    // Values built here, through the encoder and back.
+    wire("value/bool", VBool(false));
+    wire("value/int", VInt(0 - 7));
+    check_text("value/uint", hex_text_of(to_bson_hex(VUInt(18446744073709551615))),
+        "invalid value 18446744073709551615, expected a BSON integer, whose largest is 2^63 - 1");
+    wire("value/uint fits", VUInt(4294967295));
+    wire("value/i128", VI128(i128(0) - i128(21267647932558653966460912964485513215)));
+    wire("value/u128", VU128(u128(21267647932558653966460912964485513215)));
+    wire("value/float", VFloat(0.1));
+    wire("value/str", VStr("héllo"));
+    wire("value/bytes", VBytes([0, 1, 255]));
+    wire("value/none", VNone);
+    wire("value/seq", VSeq([VInt(1), VStr("x"), VBool(true)]));
+    wire("value/map", VMap([ventry(VStr("k"), VSeq([]))]));
+    wire("value/struct", vstruct("Pt", [vfield("x", VInt(1)), vfield("y", VInt(2))]));
+    wire("value/unit variant", VUnitVariant(vtag("Shape", 0, "Dot")));
+    wire("value/variant", VVariant(VPayload {.tag = vtag("Shape", 0, "Circle"), .payload = VInt(3)}));
+    wire("value/nested", VSeq([VSome(VMap([ventry(VStr("k"), VUnitVariant(vtag("E", 0, "None")))]))]));
+    check_text("value/decimal128 too big", hex_text_of(to_bson_hex(VU128(u128(21267647932558653966460912964485553216)))),
+        "invalid value 21267647932558653966460912964485553216, expected a BSON decimal128, whose magnitude is at most 2^124 - 1");
+
+    return 0;
+}

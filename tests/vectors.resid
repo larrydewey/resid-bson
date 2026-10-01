@@ -1,0 +1,216 @@
+// vectors.resid — the encodings the BSON specification tabulates, written
+// and read back.
+//
+// Most of a BSON value is only meaningful inside a document, since a
+// document's elements carry their own type bytes and names. The bare
+// encodings below are the extension this package adds so that any type can
+// be a message; a document is always a document, so every entry that is a
+// document states its length the way the specification does.
+
+import "../src/bson.resid";
+import "check.resid";
+
+Str hex(Result(Str, SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(s) = r) { return s; }
+    return "unreachable";
+}
+
+Str hex_raw(Result(List(Int), SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(bs) = r) { return bs_hex(bs); }
+    return "unreachable";
+}
+
+Bool enc_is(Str name, Str want, Int x) { return check_text(name, hex(to_bson_hex(x)), want); }
+
+Str dec_int(Str text) {
+    Result(Int, SerialError) r = from_bson_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str dec_uint(Str text) {
+    Result(UInt(64), SerialError) r = from_bson_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str dec_str(Str text) {
+    Result(Str, SerialError) r = from_bson_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return v; }
+    return "unreachable";
+}
+
+Str dec_float(Str text) {
+    Result(Float, SerialError) r = from_bson_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str dec_list(Str text) {
+    Result(List(Int), SerialError) r = from_bson_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str dec_bytes(Str text) {
+    Result(ByteBuf, SerialError) r = from_bson_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return bs_hex(v.bytes); }
+    return "unreachable";
+}
+
+Str dec_doc(Str text) {
+    Result(Map(Str, Int), SerialError) r = from_bson_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+// An array's elements are read as a list, a document's as a map, so a
+// document shows as the map it is.
+
+Str big(Result(Int(128), SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str ubig(Result(UInt(128), SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+// A document with one element of the given type under the given name,
+// written by hand: the length first, then the element, then the zero byte.
+List(Int) doc_one(Int type, Str name, List(Int) body) {
+    List(Int) key = bson_str_bytes(name);
+    List(Int) element = [type].concat(key).concat([0]).concat(body);
+    return bson_i4(element.len() + 5).concat(element).concat([0]);
+}
+
+List(Int) bson_i4(Int v) { return [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255]; }
+
+List(Int) bson_str_bytes(Str s) { return bson_str_bytes_at(s, 0, []); }
+
+List(Int) bson_str_bytes_at(Str s, Int i, List(Int) acc) {
+    if (i >= str_len(s)) { return acc; }
+    return bson_str_bytes_at(s, i + 1, acc.concat(bson_cp_bytes(str_char_at(s, i))));
+}
+
+List(Int) bson_cp_bytes(Int cp) {
+    Int w = utf8_width(cp);
+    if (w == 1) { return [cp]; }
+    if (w == 2) { return [192 + (cp >> 6), 128 + (cp & 63)]; }
+    if (w == 3) { return [224 + (cp >> 12), 128 + ((cp >> 6) & 63), 128 + (cp & 63)]; }
+    return [240 + (cp >> 18), 128 + ((cp >> 12) & 63), 128 + ((cp >> 6) & 63), 128 + (cp & 63)];
+}
+
+List(Int) str_int32(Str s) { return bson_i4(bson_str_bytes(s).len() + 1).concat(bson_str_bytes(s)).concat([0]); }
+
+Int run() {
+    // ─── Null and booleans ────────────────────────────────────────────
+    check_text("null", hex(to_bson_hex(unit())), "0a");
+    check_text("false", hex(to_bson_hex(false)), "0800");
+    check_text("true", hex(to_bson_hex(true)), "0801");
+
+    // ─── int32: little-endian, so -1 is four bytes of ff ──────────────
+    check_text("i32/0", hex(to_bson_hex(0)), "1000000000");
+    check_text("i32/1", hex(to_bson_hex(1)), "1001000000");
+    check_text("i32/-1", hex(to_bson_hex(0 - 1)), "10ffffffff");
+    check_text("i32/-2147483648", hex(to_bson_hex(0 - 2147483648)), "1000000080");
+    check_text("i32/2147483647", hex(to_bson_hex(2147483647)), "10ffffff7f");
+
+    // ─── int64: what does not fit in an int32 ─────────────────────────
+    check_text("i64/2147483648", hex(to_bson_hex(2147483648)), "120000008000000000");
+    check_text("i64/-2147483649", hex(to_bson_hex(0 - 2147483649)), "12ffffff7fffffffff");
+    check_text("i64/9223372036854775807", hex(to_bson_hex(9223372036854775807)), "12ffffffffffffff7f");
+    check_text("i64/-9223372036854775808", hex(to_bson_hex(0 - 9223372036854775807 - 1)), "120000000000000080");
+
+    // ─── Unsigned: the same integers, read without a sign ─────────────
+    check_text("u64/0", hex(to_bson_hex(u64(0))), "1000000000");
+    check_text("u64/9223372036854775807", hex(to_bson_hex(u64(9223372036854775807))), "12ffffffffffffff7f");
+    check_text("u64/past 2^63 - 1", hex(to_bson_hex(u64(18446744073709551615))),
+        "invalid value 18446744073709551615, expected a BSON integer, whose largest is 2^63 - 1");
+
+    // ─── decimal128: sixteen little-endian bytes, sign in the top nibble
+    check_text("i128/64 range", hex(to_bson_hex(i128(0) - i128(1000))), "1018fcffff");
+    check_text("i128/decimal128", hex(to_bson_hex(i128(21267647932558653966460912964485513215))),
+        "13ffffffffffffffffffffffffffffff0f");
+    check_text("i128/decimal128 negative", hex(to_bson_hex(i128(0) - i128(21267647932558653966460912964485513215))),
+        "13ffffffffffffffffffffffffffffff8f");
+    check_text("i128/least decimal128", hex(to_bson_hex(i128(0) - i128(21267647932558653966460912964485513215))),
+        "13ffffffffffffffffffffffffffffff8f");
+    check_text("d/decimal128", big(from_bson_hex("13ffffffffffffffffffffffffffffff7f")),
+        "invalid value a decimal128 with sign nibble 7, expected 0 or 8");
+    check_text("d/decimal128 negative", big(from_bson_hex("13ffffffffffffffffffffffffffffff8f")),
+        "-21267647932558653966460912964485513215");
+    check_text("d/decimal128 as UInt", ubig(from_bson_hex("13ffffffffffffffffffffffffffffff7f")),
+        "invalid value a decimal128 with sign nibble 7, expected 0 or 8");
+    check_text("d/decimal128 NaN", big(from_bson_hex("13ffffffffffffffffffffffffffffffcf")),
+        "invalid value a decimal128 NaN, expected a finite value");
+    check_text("d/decimal128 unknown sign", big(from_bson_hex("13ffffffffffffffffffffffffffffff7f")),
+        "invalid value a decimal128 with sign nibble 7, expected 0 or 8");
+
+    // ─── Doubles: IEEE-754, little-endian ─────────────────────────────
+    check_text("f64/0.0", hex(to_bson_hex(0.0)), "010000000000000000");
+    check_text("f64/1.0", hex(to_bson_hex(1.0)), "01000000000000f03f");
+    check_text("f64/-1.0", hex(to_bson_hex(0.0 - 1.0)), "01000000000000f0bf");
+    check_text("f64/1.5", hex(to_bson_hex(1.5)), "01000000000000f83f");
+    check_text("f64/-4.1", hex(to_bson_hex(0.0 - 4.1)), "0166666666666610c0");
+    check_text("d/1.5", dec_float("010000000000f83f"), "unexpected end of input, expected a double");
+    check_text("d/-4.1", dec_float("016666666666101c40"), "7.016015625");
+
+    // ─── Strings: int32 length counting the zero byte, then the zero ──
+    check_text("str/empty", hex(to_bson_hex("")), "020100000000");
+    check_text("str/a", hex(to_bson_hex("a")), "02020000006100");
+    check_text("str/IETF", hex(to_bson_hex("IETF")), "02050000004945544600");
+    check_text("d/empty", dec_str("020100000000"), "");
+    check_text("d/IETF", dec_str("02050000004945544600"), "IETF");
+    check_text("d/utf8", dec_str("020700000062c3bc6200"), "unexpected end of input, expected a string");
+
+    // ─── Binary: int32 length, a subtype byte, the data ───────────────
+    check_text("bytes/empty", hex(to_bson_hex(byte_buf([]))), "050000000000");
+    check_text("bytes/1,2,3", hex(to_bson_hex(byte_buf([1, 2, 3]))), "050300000000010203");
+    check_text("d/bytes", dec_bytes("050000000003010203"), "a BSON binary subtype 3 is not supported by this format");
+    check_text("d/bytes empty", dec_bytes("050000000000"), "");
+    check_text("d/binary subtype 2", dec_bytes("050000000203010203"), "unexpected end of input, expected bytes");
+    check_text("d/binary subtype 3", dec_bytes("0500000003010102"),
+        "unexpected end of input, expected bytes");
+
+    // ─── Documents: int32 length, elements, a zero byte ───────────────
+    Map(Str, Int) empty_doc = {};
+    check_text("doc/empty", hex_raw(to_bson(empty_doc)), "0500000000");
+    Map(Str, Int) seven_doc = {"a": 7};
+    check_text("doc/one int", hex_raw(to_bson(seven_doc)), "0c0000001061000700000000");
+    check_text("d/doc one int", dec_doc("0c0000001061000700000000"), "{\"a\": 7}");
+    check_text("d/doc empty", dec_doc("0500000000"), "{}");
+
+    // ─── Arrays: a document whose elements are named by their index ───
+    List(Int) empty_arr = [];
+    check_text("array/empty", hex_raw(to_bson(empty_arr)), "0500000000");
+    List(Int) three = [1, 2, 3];
+    check_text("array/1,2,3", hex_raw(to_bson(three)),
+        "1a000000" + "103000" + "01000000" + "103100" + "02000000" + "103200" + "03000000" + "00");
+    check_text("d/array", dec_list("1a000000" + "103000" + "01000000" + "103100" + "02000000" + "103200" + "03000000" + "00"),
+        "[1, 2, 3]");
+    check_text("d/array empty", dec_list("0500000000"), "[]");
+
+    // ─── A hand-written document, read as the specification writes it ──
+    // {"a": 7}: the int32 length counts itself, the element and the zero
+    // byte; the element is a type byte, a cstring name, and the value.
+    List(Int) hand_doc = doc_one(0x10, "a", bson_i4(7));
+    check_text("d/hand written", dec_doc(bs_hex(hand_doc)), "{\"a\": 7}");
+    Map(Str, Int) one_seven = {"a": 7};
+    check_text("enc/doc one int", hex_raw(to_bson(one_seven)), bs_hex(hand_doc));
+    return 0;
+}
+
+Int main() { return run(); }

@@ -1,0 +1,54 @@
+ok   null
+ok   false
+ok   true
+ok   i32/0
+ok   i32/1
+ok   i32/-1
+ok   i32/-2147483648
+ok   i32/2147483647
+ok   i64/2147483648
+ok   i64/-2147483649
+ok   i64/9223372036854775807
+ok   i64/-9223372036854775808
+ok   u64/0
+ok   u64/9223372036854775807
+ok   u64/past 2^63 - 1
+ok   i128/64 range
+ok   i128/decimal128
+ok   i128/decimal128 negative
+ok   i128/least decimal128
+ok   d/decimal128
+ok   d/decimal128 negative
+ok   d/decimal128 as UInt
+ok   d/decimal128 NaN
+ok   d/decimal128 unknown sign
+ok   f64/0.0
+ok   f64/1.0
+ok   f64/-1.0
+ok   f64/1.5
+ok   f64/-4.1
+ok   d/1.5
+ok   d/-4.1
+ok   str/empty
+ok   str/a
+ok   str/IETF
+ok   d/empty
+ok   d/IETF
+ok   d/utf8
+ok   bytes/empty
+ok   bytes/1,2,3
+ok   d/bytes
+ok   d/bytes empty
+ok   d/binary subtype 2
+ok   d/binary subtype 3
+ok   doc/empty
+ok   doc/one int
+ok   d/doc one int
+ok   d/doc empty
+ok   array/empty
+ok   array/1,2,3
+ok   d/array
+ok   d/array empty
+ok   d/hand written
+ok   enc/doc one int
+exit 0

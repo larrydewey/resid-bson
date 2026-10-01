@@ -1,0 +1,198 @@
+// errors.resid — what the format reports when the bytes are wrong. Every
+// case is an error value with a kind and a path, never an abort.
+//
+// Most of the input here is a document, since that is where a type byte and
+// a name live: a document is an int32 length, its elements, and a zero
+// byte, and an element is a type byte, a cstring name, and the value.
+
+import "../src/bson.resid";
+import "check.resid";
+
+type Point = { Int x; Int y; };
+
+type Shape = Circle(Int) | Dot;
+
+List(Str) point_fields() { return ["x", "y"]; }
+
+List(Str) shape_variants() { return ["Circle", "Dot"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point(F s) {
+    F s1 = read_struct_begin(s, "Point", point_fields())?;
+    return dec_point_fields(s1, None, None);
+}
+Decode(Point, F) = dec_point;
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_fields(F s, Option(Int) x, Option(Int) y) {
+    Parsed(FieldKey, F) k = read_field(s, point_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_point_slot(k.rest, i, x, y),
+        UnknownField(name) => dec_point_fields(skip_unknown(k.rest, name, point_fields(), false)?, x, y),
+        EndOfFields => finish_point(k.rest, x, y)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_slot(F s, Int i, Option(Int) x, Option(Int) y) {
+    if (i == 0) {
+        Parsed(Option(Int), F) v = read_slot(s, x, "x")?;
+        return dec_point_fields(v.rest, v.value, y);
+    }
+    Parsed(Option(Int), F) v = read_slot(s, y, "y")?;
+    return dec_point_fields(v.rest, x, v.value);
+}
+
+Result(Parsed(Point, F), SerialError) finish_point(F s, Option(Int) x, Option(Int) y) {
+    Int xv = require(x, "x")?;
+    Int yv = require(y, "y")?;
+    return parsed(Point {.x = xv, .y = yv}, s);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Shape, F), SerialError) dec_shape(F s) {
+    Parsed(Int, F) v = read_variant(s, "Shape", shape_variants())?;
+    if (v.value == 0) {
+        Parsed(Int, F) r = read_newtype_payload(v.rest, "Circle")?;
+        return parsed(Circle(r.value), r.rest);
+    }
+    return read_unit_payload(v.rest, Dot);
+}
+Decode(Shape, F) = dec_shape;
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+Str int_err(Str text) {
+    Result(Int, SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str uint_err(Str text) {
+    Result(UInt(64), SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str str_err(Str text) {
+    Result(Str, SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str float_err(Str text) {
+    Result(Float, SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str list_err(Str text) {
+    Result(List(Int), SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str map_err(Str text) {
+    Result(Map(Str, Int), SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str point_err(Str text) {
+    Result(Point, SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str shape_err(Str text) {
+    Result(Shape, SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str bytes_err(Str text) {
+    Result(ByteBuf, SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str big_err(Str text) {
+    Result(Int(128), SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Str ubig_err(Str text) {
+    Result(UInt(128), SerialError) r = from_bson_hex(text);
+    return err_of(r);
+}
+
+Int main() {
+    // Nothing at all, and nothing after.
+    check_text("e/empty", int_err(""), "unexpected end of input, expected an integer");
+    check_text("e/trailing", int_err("100100000000"), "trailing input after the value: 1 byte(s)");
+    check_text("e/doc empty", map_err(""), "unexpected end of input, expected a map");
+
+    // Document headers: the length counts itself, the elements and the
+    // zero byte, and the zero byte has to be there.
+    check_text("d/length four", map_err("0400000000"), "invalid length 4, expected a BSON document of at least 5 byte(s)");
+    check_text("d/length negative", map_err("ffffffff00"), "invalid length -1, expected a BSON document of at least 5 byte(s)");
+    check_text("d/length past input", map_err("6c00000000"), "unexpected end of input, expected a map");
+    check_text("d/length one short", map_err("0600000000"), "unexpected end of input, expected a map");
+    check_text("d/no zero byte", map_err("0600000010610001000000"), "a BSON document does not end with a zero byte");
+    check_text("d/zero byte not last", map_err("0c0000001078000100000001"), "a BSON document does not end with a zero byte");
+
+    // Type bytes applied to the wrong verb.
+    check_text("t/double as int", int_err("01000000000000000000"), "invalid type: expected an integer, found a double");
+    check_text("t/null as int", int_err("0a"), "invalid type: expected an integer, found null");
+    check_text("t/bool as int", int_err("0801"), "invalid type: expected an integer, found a boolean");
+    check_text("t/string as int", int_err("02020000006100"), "invalid type: expected an integer, found a string");
+    check_text("t/binary as str", str_err("050000000000"), "invalid type: expected a string, found binary");
+    check_text("t/int as float", float_err("1001000000"), "invalid type: expected a float, found a 32-bit integer");
+    check_text("t/string as bytes", bytes_err("02020000006100"), "invalid type: expected bytes, found a string");
+    check_text("t/ObjectId", int_err("07"), "invalid type: expected an integer, found an ObjectId");
+    check_text("t/regexp", int_err("0b616200"), "invalid type: expected an integer, found a regular expression");
+
+    // Inside a document, where the type byte belongs to the element.
+    check_text("t/sequence value", map_err("0d000000046100050000000000"), "invalid type: expected an integer, found an array at [\"a\"]");
+    check_text("t/document value", map_err("0d000000036100050000000000"), "invalid type: expected an integer, found a document at [\"a\"]");
+    check_text("t/binary value", map_err("0d000000056100000000000000"), "invalid type: expected an integer, found binary at [\"a\"]");
+    check_text("t/timestamp value", map_err("10000000116100000000000000000000"), "a timestamp is not supported by this format");
+
+    // Truncated payloads.
+    check_text("e/int32 short", int_err("100100"), "unexpected end of input, expected a 32-bit integer");
+    check_text("e/int64 short", int_err("1201000000"), "unexpected end of input, expected a 64-bit integer");
+    check_text("e/double short", float_err("0100000000"), "unexpected end of input, expected a double");
+    check_text("e/decimal128 short", big_err("1300000000000000"), "unexpected end of input, expected a decimal128");
+    check_text("e/string length lies", str_err("02090000006100"), "unexpected end of input, expected a string");
+    check_text("e/string length zero", str_err("0200000000"), "invalid length 0, expected a BSON string of at least one byte");
+    check_text("e/string no zero", str_err("0203000000616263"), "a BSON string does not end with a zero byte");
+    check_text("e/binary short", bytes_err("05050000000001"), "unexpected end of input, expected bytes");
+    check_text("e/binary subtype", bytes_err("050300000003010203"), "a BSON binary subtype 3 is not supported by this format");
+    check_text("e/name runs to the end", map_err("0c000000103000010000"), "unexpected end of input, expected a map");
+    check_text("e/array element short", list_err("090000001030000100"), "unexpected end of input, expected a sequence");
+
+    // Struct fields and variants.
+    check_text("f/missing", point_err("0c0000001078000100000000"), "missing field `y`");
+    check_text("f/duplicate", point_err("1a00000010780001000000107900020000001078000300000000"), "duplicate field `x`");
+    check_text("f/unknown skipped", point_err("10000000087a00011078000100000000"), "missing field `y`");
+    check_text("f/unknown field", point_err("120000000b7a006162001078000100000000"), "a regular expression is not supported by this format");
+    check_text("v/unknown", shape_err("02040000005a7a7a00"), "unknown variant `Zzz`, expected `Circle` or `Dot`");
+        // A variant's name is the first element's, so a document whose first
+    // element is a payload-less variant document fails on the payload.
+    check_text("v/empty payload", shape_err("1200000003436972636c6500050000000000"), "invalid type: expected an integer, found a document at ::Circle");
+    check_text("v/empty document", shape_err("0500000000"), "unexpected end of input, expected a variant name");
+    check_text("v/two entries", shape_err("1e00000010436972636c65000100000002446f740004000000446f740000"), "a variant document has more than one entry");
+
+    // Numbers out of range for the type asked for.
+    check_text("n/negative as uint", uint_err("10ffffffff"), "invalid value -1, expected an unsigned integer");
+    check_text("n/decimal128 negative as uint", ubig_err("13ffffffffffffffffffffffffffffff8f"),
+        "invalid value -21267647932558653966460912964485513215, expected an unsigned 128-bit integer");
+    check_text("n/decimal128 NaN", big_err("13ffffffffffffffffffffffffffffffcf"),
+        "invalid value a decimal128 NaN, expected a finite value");
+    check_text("n/decimal128 sign", big_err("13ffffffffffffffffffffffffffffff3f"),
+        "invalid value a decimal128 with sign nibble 3, expected 0 or 8");
+
+    // Text that is not text.
+    check_text("u/truncated sequence", str_err("020300000061c3"), "unexpected end of input, expected a string");
+    check_text("u/continuation first", str_err("02020000008000"), "invalid UTF-8 in a string: a continuation byte starts it");
+    check_text("u/bad continuation", str_err("0203000000c34100"), "invalid UTF-8 in a string");
+    check_text("u/name not text", map_err("0c0000001080000100000000"), "invalid UTF-8 in a map key: a continuation byte starts it");
+
+    // The hex front end.
+    check_text("hex/odd length", err_of(bs_unhex("010")), "invalid hex digit in \"010\"");
+    check_text("hex/bad digit", err_of(bs_unhex("01zz")), "invalid hex digit in \"01zz\"");
+
+    return 0;
+}
