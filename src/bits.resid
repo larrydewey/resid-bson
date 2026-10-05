@@ -5,7 +5,7 @@
 // integer is written least significant byte first, and a double is the
 // IEEE-754 bit pattern reversed from the big-endian form.
 
-import "../../resid-serial/src/serial.resid";
+import "resid-serial/serial.resid";
 
 // ─── Little-endian integers ─────────────────────────────────────────
 

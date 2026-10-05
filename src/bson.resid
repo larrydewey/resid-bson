@@ -41,7 +41,7 @@
 // with Encode/Decode instances can be a message; a document is still a
 // document, and a driver reading a legal BSON stream sees nothing unusual.
 
-import "../../resid-serial/src/serial.resid";
+import "resid-serial/serial.resid";
 import "bits.resid";
 
 // ─── Element types ──────────────────────────────────────────────────
