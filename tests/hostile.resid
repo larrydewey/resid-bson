@@ -164,5 +164,8 @@ Int main() {
     check("encode/long array", encoded_length(vstruct("B", [vfield("xs", VSeq(ints(0, 20000, ListBuf())))])) == 208904);
     check("encode/wide document", encoded_length(vstruct("B", fields(0, 20000, ListBuf()))) == 228895);
 
+    // Doubles at the ends of the range.
+    check_text("float/subnormal", value_of([0x10, 0, 0, 0, 0x01, 0x66, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]), "{\"f\": 5e-324}");
+    check_text("float/largest", value_of([0x10, 0, 0, 0, 0x01, 0x66, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xEF, 0x7F, 0]), "{\"f\": 1.7976931348623157e+308}");
     return 0;
 }

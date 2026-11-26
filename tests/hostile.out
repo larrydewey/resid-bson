@@ -14,4 +14,6 @@ ok   utf8/four bytes
 ok   utf8/in a name
 ok   encode/long array
 ok   encode/wide document
+ok   float/subnormal
+ok   float/largest
 exit 0
