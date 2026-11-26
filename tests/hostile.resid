@@ -1,0 +1,140 @@
+// hostile.resid — bytes an attacker would send, and the round trips that
+// once went wrong. Every check here failed or took seconds before the fix
+// it pins.
+
+import "../src/bson.resid";
+import "resid-serial/value.resid";
+import "check.resid";
+
+// Outer { Inner o; Int x; } and Inner { Int b; }, by hand, so a document
+// inside a document is read the way a typed decode reads it.
+type Inner = { Int b; };
+type Outer = { Inner o; Int x; };
+
+List(Str) inner_fields() { return ["b"]; }
+List(Str) outer_fields() { return ["o", "x"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Inner, F), SerialError) dec_inner(F s) {
+    F s0 = read_struct_begin(s, "Inner", inner_fields())?;
+    return dec_inner_at(s0, None);
+}
+Decode(Inner, F) = dec_inner;
+
+@needs(Decoder(F))
+Result(Parsed(Inner, F), SerialError) dec_inner_at(F s, Option(Int) b) {
+    Parsed(FieldKey, F) k = read_field(s, inner_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_inner_slot(k.rest, b),
+        UnknownField(name) => dec_inner_at(skip_unknown(k.rest, name, inner_fields(), false)?, b),
+        EndOfFields => dec_inner_end(k.rest, b)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Inner, F), SerialError) dec_inner_slot(F s, Option(Int) b) {
+    Parsed(Option(Int), F) v = read_slot(s, b, "b")?;
+    return dec_inner_at(v.rest, v.value);
+}
+
+Result(Parsed(Inner, F), SerialError) dec_inner_end(F s, Option(Int) b) {
+    Int bv = require(b, "b")?;
+    return parsed(Inner {.b = bv}, s);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Outer, F), SerialError) dec_outer(F s) {
+    F s0 = read_struct_begin(s, "Outer", outer_fields())?;
+    return dec_outer_at(s0, None, None);
+}
+Decode(Outer, F) = dec_outer;
+
+@needs(Decoder(F))
+Result(Parsed(Outer, F), SerialError) dec_outer_at(F s, Option(Inner) o, Option(Int) x) {
+    Parsed(FieldKey, F) k = read_field(s, outer_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_outer_slot(k.rest, i, o, x),
+        UnknownField(name) => dec_outer_at(skip_unknown(k.rest, name, outer_fields(), false)?, o, x),
+        EndOfFields => dec_outer_end(k.rest, o, x)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Outer, F), SerialError) dec_outer_slot(F s, Int i, Option(Inner) o, Option(Int) x) {
+    if (i == 0) {
+        Parsed(Option(Inner), F) v = read_slot(s, o, "o")?;
+        return dec_outer_at(v.rest, v.value, x);
+    }
+    Parsed(Option(Int), F) w = read_slot(s, x, "x")?;
+    return dec_outer_at(w.rest, o, w.value);
+}
+
+Result(Parsed(Outer, F), SerialError) dec_outer_end(F s, Option(Inner) o, Option(Int) x) {
+    Inner ov = require(o, "o")?;
+    Int xv = require(x, "x")?;
+    return parsed(Outer {.o = ov, .x = xv}, s);
+}
+
+Str outer_of(List(Int) bs) {
+    Result(Outer, SerialError) r = from_bson(bs);
+    if (Err(e) = r) { return e.msg; }
+    if (Ok(v) = r) { return f"o.b = {v.o.b}, x = {v.x}"; }
+    return "unreachable";
+}
+
+// n documents, each the only element ("a") of the one around it.
+List(Int) nested(Int n) { return nest_open(n, 0, ListBuf()); }
+
+List(Int) nest_open(Int n, Int i, ListBuf(Int) b) {
+    if (i >= n) { return nest_close(n, 0, b.push(5).push(0).push(0).push(0).push(0)); }
+    Int len = 5 + 8 * (n - i);
+    ListBuf(Int) b1 = b.push(len & 255).push((len >> 8) & 255).push((len >> 16) & 255).push(0);
+    return nest_open(n, i + 1, b1.push(0x03).push(0x61).push(0));
+}
+
+List(Int) nest_close(Int n, Int i, ListBuf(Int) b) {
+    if (i >= n) { return b.finish(); }
+    return nest_close(n, i + 1, b.push(0));
+}
+
+// The message of a failed Value decode without its path, or what it shows.
+Str value_of(List(Int) bs) {
+    Result(Value, SerialError) r = from_bson(bs);
+    if (Err(e) = r) { return e.msg; }
+    if (Ok(v) = r) { return show_value(v); }
+    return "unreachable";
+}
+
+// {"s": <a string of these bytes>}
+List(Int) string_doc(List(Int) text) {
+    Int n = text.len() + 1;
+    List(Int) body = [0x02, 0x73, 0, n, 0, 0, 0].concat(text).concat([0]);
+    Int len = body.len() + 5;
+    return [len, 0, 0, 0].concat(body).concat([0]);
+}
+
+List(Value) ints(Int i, Int n, ListBuf(Value) b) {
+    if (i >= n) { return b.finish(); }
+    return ints(i + 1, n, b.push(VInt(i)));
+}
+
+List(VField) fields(Int i, Int n, ListBuf(VField) b) {
+    if (i >= n) { return b.finish(); }
+    return fields(i + 1, n, b.push(vfield(f"k{i}", VInt(i))));
+}
+
+Int encoded_length(Value v) {
+    Result(List(Int), SerialError) bs = to_bson(v);
+    if (Ok(b) = bs) { return b.len(); }
+    return 0 - 1;
+}
+
+Int main() {
+    // A wide document encodes in one pass.
+    check("encode/long array", encoded_length(vstruct("B", [vfield("xs", VSeq(ints(0, 20000, ListBuf())))])) == 208904);
+    check("encode/wide document", encoded_length(vstruct("B", fields(0, 20000, ListBuf()))) == 228895);
+
+    return 0;
+}

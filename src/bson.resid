@@ -290,12 +290,13 @@ List(Int) bs_doc_bytes(BsElems es) {
     return bs_i4(payload.len() + 5).concat(payload).concat([0]);
 }
 
-List(BsElem) bs_ordered(BsElems es) { return bs_ordered_at(es, []); }
+List(BsElem) bs_ordered(BsElems es) { return bs_ordered_at(es, ListBuf()); }
 
 // The elements as the wire has them: oldest first, which is the reverse of
-// the order they were written in.
-List(BsElem) bs_ordered_at(BsElems elems, List(BsElem) acc) {
-    return match elems { BeNil => acc, BeCons(link) => bs_ordered_at(link.next, [link.el].concat(acc)) };
+// the order they were written in. Gathered newest first and reversed once:
+// putting each in front of the rest would copy the rest every time.
+List(BsElem) bs_ordered_at(BsElems elems, ListBuf(BsElem) acc) {
+    return match elems { BeNil => acc.finish().reverse(), BeCons(link) => bs_ordered_at(link.next, acc.push(link.el)) };
 }
 
 // Each element as the wire has it: the type byte, the name and its zero
