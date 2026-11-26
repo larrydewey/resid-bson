@@ -3,6 +3,9 @@ ok   depth/64 documents
 ok   depth/65 documents
 ok   depth/20000 documents
 ok   depth/a wider limit
+ok   room/well formed
+ok   room/int past its document
+ok   room/string past its document
 ok   encode/long array
 ok   encode/wide document
 exit 0

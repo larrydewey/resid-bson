@@ -141,6 +141,17 @@ Int main() {
     Result(Value, SerialError) wider = decode_value(bson_decoder_depth(nested(3000), 5000));
     check_text("depth/a wider limit", err_of(wider), "ok");
 
+    // A length that reaches past the document it is in is refused.
+    // {"o": {"b": 1}, "x": 7}, well formed, then with the inner document
+    // claiming 10 bytes so its zero falls inside its own int32.
+    List(Int) good = [0x1B, 0, 0, 0, 0x03, 0x6F, 0, 0x0C, 0, 0, 0, 0x10, 0x62, 0, 1, 0, 0, 0, 0, 0x10, 0x78, 0, 7, 0, 0, 0, 0];
+    check_text("room/well formed", outer_of(good), "o.b = 1, x = 7");
+    List(Int) short = [0x1B, 0, 0, 0, 0x03, 0x6F, 0, 0x0A, 0, 0, 0, 0x10, 0x62, 0, 1, 0, 0, 0, 0, 0x10, 0x78, 0, 7, 0, 0, 0, 0];
+    check_text("room/int past its document", outer_of(short), "unexpected end of input, expected a 32-bit integer");
+    // {"o": {"s": "abc"}, "x": 7} with the string claiming 8 bytes.
+    List(Int) str_long = [0x1F, 0, 0, 0, 0x03, 0x6F, 0, 0x10, 0, 0, 0, 0x02, 0x73, 0, 8, 0, 0, 0, 0x61, 0x62, 0x63, 0, 0, 0x10, 0x78, 0, 7, 0, 0, 0, 0];
+    check_text("room/string past its document", value_of(str_long), "unexpected end of input, expected a map");
+
     // A wide document encodes in one pass.
     check("encode/long array", encoded_length(vstruct("B", [vfield("xs", VSeq(ints(0, 20000, ListBuf())))])) == 208904);
     check("encode/wide document", encoded_length(vstruct("B", fields(0, 20000, ListBuf()))) == 228895);

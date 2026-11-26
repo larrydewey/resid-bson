@@ -503,6 +503,17 @@ BsFrame bd_top(BsonDec d, BsFrame none) {
     return match o { BkNil => none, BkCons(c) => c.top };
 }
 
+// Where what is read now has to end: at the open document's zero byte,
+// which belongs to the document, or at the end of the input. A length that
+// reaches past it is a lie about the document it is in.
+Int bd_room(BsonDec d) {
+    Int end = bd_doc_end(d);
+    return if (end < 0) { d.in.len() } else { end };
+}
+
+// `n` bytes from `off` past the read position, inside the room there is.
+Bool bd_has(BsonDec d, Int off, Int n) { return bs_has(d.in, d.pos + off, n) && d.pos + off + n <= bd_room(d); }
+
 // The type of the value that comes next: the element's own, or a fresh
 // type byte at the top level.
 Result(Parsed(Int, BsonDec), SerialError) bd_take_type(BsonDec d, Str what) {
@@ -550,7 +561,7 @@ BsonDec bd_cstring_to(BsonDec d, Str what) {
 }
 
 // The zero byte that ends a cstring, or -1.
-Int bd_zero(BsonDec d, Int at, Str what) { return bd_zero_at(d, at, what, d.in.len()); }
+Int bd_zero(BsonDec d, Int at, Str what) { return bd_zero_at(d, at, what, bd_room(d)); }
 
 Int bd_zero_at(BsonDec d, Int at, Str what, Int end) {
     if (at >= end) { return 0 - 1; }
@@ -560,7 +571,7 @@ Int bd_zero_at(BsonDec d, Int at, Str what, Int end) {
 
 // An int32 payload, and the state just past it.
 Result(Parsed(Int, BsonDec), SerialError) bd_i32(BsonDec d, Str what) {
-    if (!bs_has(d.in, d.pos, 4)) { return Err(eof_error(what)); }
+    if (!bd_has(d, 0, 4)) { return Err(eof_error(what)); }
     return parsed(bs_read_signed(d.in, d.pos, 4), bd_take(d, 4));
 }
 
@@ -620,11 +631,11 @@ Result(Parsed(Int, BsonDec), SerialError) bd_int(BsonDec d) { return bd_signed(d
 Result(Parsed(Int, BsonDec), SerialError) bd_signed(BsonDec d, Str what) {
     BsOpen o = bd_open_type(d, what)?;
     if (o.type == 0x10) {
-        if (!bs_has(o.rest.in, o.rest.pos, 4)) { return Err(eof_error("a 32-bit integer")); }
+        if (!bd_has(o.rest, 0, 4)) { return Err(eof_error("a 32-bit integer")); }
         return parsed(bs_read_signed(o.rest.in, o.rest.pos, 4), bd_take(o.rest, 4));
     }
     if (o.type == 0x12) {
-        if (!bs_has(o.rest.in, o.rest.pos, 8)) { return Err(eof_error("a 64-bit integer")); }
+        if (!bd_has(o.rest, 0, 8)) { return Err(eof_error("a 64-bit integer")); }
         return parsed(bs_read_signed(o.rest.in, o.rest.pos, 8), bd_take(o.rest, 8));
     }
     return Err(invalid_type(what, bs_type_name(o.type)));
@@ -642,13 +653,13 @@ Result(Parsed(Int(128), BsonDec), SerialError) bd_i128(BsonDec d) { return bd_an
 Result(Parsed(Int(128), BsonDec), SerialError) bd_any128(BsonDec d, Str what) {
     BsOpen o = bd_open_type(d, what)?;
     if (o.type == 0x13) {
-        if (!bs_has(o.rest.in, o.rest.pos, 16)) { return Err(eof_error("a decimal128")); }
+        if (!bd_has(o.rest, 0, 16)) { return Err(eof_error("a decimal128")); }
         Int(128) v = bs_dec128_from(o.rest.in, o.rest.pos)?;
         return parsed(v, bd_take(o.rest, 16));
     }
     if (o.type == 0x10 || o.type == 0x12) {
         Int n = if (o.type == 0x10) { 4 } else { 8 };
-        if (!bs_has(o.rest.in, o.rest.pos, n)) { return Err(eof_error(what)); }
+        if (!bd_has(o.rest, 0, n)) { return Err(eof_error(what)); }
         return parsed((Int(128))bs_read_signed(o.rest.in, o.rest.pos, n), bd_take(o.rest, n));
     }
     return Err(invalid_type(what, bs_type_name(o.type)));
@@ -663,7 +674,7 @@ Result(Parsed(UInt(128), BsonDec), SerialError) bd_u128(BsonDec d) {
 Result(Parsed(Float, BsonDec), SerialError) bd_float(BsonDec d) {
     BsOpen o = bd_open_type(d, "a float")?;
     if (o.type != 0x01) { return Err(invalid_type("a float", bs_type_name(o.type))); }
-    if (!bs_has(o.rest.in, o.rest.pos, 8)) { return Err(eof_error("a double")); }
+    if (!bd_has(o.rest, 0, 8)) { return Err(eof_error("a double")); }
     return parsed(bs_f64_from(o.rest.in, o.rest.pos), bd_take(o.rest, 8));
 }
 
@@ -694,7 +705,7 @@ Result(Parsed(Str, BsonDec), SerialError) bd_str_body(BsonDec d, Str what) {
     Parsed(Int, BsonDec) n = bd_i32(d, what)?;
     Int len = n.value;
     if (len < 1) { return Err(invalid_length(len, "a BSON string of at least one byte")); }
-    if (!bs_has(n.rest.in, n.rest.pos, len)) { return Err(eof_error(what)); }
+    if (!bd_has(n.rest, 0, len)) { return Err(eof_error(what)); }
     if (n.rest.in[n.rest.pos + len - 1] != 0) { return Err(syntax_error("a BSON string does not end with a zero byte")); }
     Str s = bs_str_at(n.rest.in, n.rest.pos, n.rest.pos + len - 1, what)?;
     return parsed(s, bd_take(n.rest, len));
@@ -712,7 +723,7 @@ Result(Parsed(Int, BsonDec), SerialError) bd_str_begin(BsonDec d) {
     Parsed(Int, BsonDec) n = bd_i32(o.rest, "a string")?;
     Int len = n.value;
     if (len < 1) { return Err(invalid_length(len, "a BSON string of at least one byte")); }
-    if (!bs_has(n.rest.in, n.rest.pos, len)) { return Err(eof_error("a string")); }
+    if (!bd_has(n.rest, 0, len)) { return Err(eof_error("a string")); }
     if (n.rest.in[n.rest.pos + len - 1] != 0) { return Err(syntax_error("a BSON string does not end with a zero byte")); }
     Int end = n.rest.pos + len - 1;
     Int chars = bs_cp_count(n.rest.in, n.rest.pos, end, "a string")?;
@@ -746,7 +757,7 @@ Result(Parsed(List(Int), BsonDec), SerialError) bd_bin_body(BsonDec d, Str what)
     if (len < 0) { return Err(invalid_length(len, "a BSON binary length")); }
     if (n.rest.pos + 1 > n.rest.in.len()) { return Err(eof_error(what)); }
     Int sub = n.rest.in[n.rest.pos];
-    if (!bs_has(n.rest.in, n.rest.pos + 1, len)) { return Err(eof_error(what)); }
+    if (!bd_has(n.rest, 1, len)) { return Err(eof_error(what)); }
     if (sub != 0x00 && sub != 0x02 && sub != 0x04) { return Err(unsupported(f"a BSON binary subtype {sub}")); }
     List(Int) data = n.rest.in[n.rest.pos + 1..n.rest.pos + 1 + len];
     return parsed(data, bd_take(n.rest, 1 + len));
@@ -761,7 +772,7 @@ Result(Parsed(Int, BsonDec), SerialError) bd_bytes_begin(BsonDec d) {
     if (n.rest.pos + 1 > n.rest.in.len()) { return Err(eof_error("bytes")); }
     Int sub = n.rest.in[n.rest.pos];
     if (sub != 0x00 && sub != 0x02 && sub != 0x04) { return Err(unsupported(f"a BSON binary subtype {sub}")); }
-    if (!bs_has(n.rest.in, n.rest.pos + 1, len)) { return Err(eof_error("bytes")); }
+    if (!bd_has(n.rest, 1, len)) { return Err(eof_error("bytes")); }
     return parsed(len, bd_push(bd_take(n.rest, 1), BsBin(n.rest.pos + 1 + len)));
 }
 
@@ -848,7 +859,7 @@ Result(BsonDec, SerialError) bd_doc_open(BsonDec d, Str what) {
     Int len = n.value;
     if (len < 5) { return Err(invalid_length(len, "a BSON document of at least 5 byte(s)")); }
     Int end = p + len - 1;
-    if (end >= n.rest.in.len()) { return Err(eof_error(what)); }
+    if (end >= bd_room(n.rest)) { return Err(eof_error(what)); }
     if (n.rest.in[end] != 0) { return Err(syntax_error("a BSON document does not end with a zero byte")); }
     return bd_open_doc(n.rest, end);
 }
@@ -1087,7 +1098,7 @@ Result(BsonDec, SerialError) bd_skip_value(Int t, BsonDec d, Str what) {
 }
 
 Result(BsonDec, SerialError) bd_skip_n(BsonDec d, Int n, Str what) {
-    if (!bs_has(d.in, d.pos, n)) { return Err(eof_error(what)); }
+    if (!bd_has(d, 0, n)) { return Err(eof_error(what)); }
     return Ok(bd_take(d, n));
 }
 
@@ -1095,7 +1106,7 @@ Result(BsonDec, SerialError) bd_skip_string(BsonDec d, Str what) {
     Parsed(Int, BsonDec) n = bd_i32(d, what)?;
     Int len = n.value;
     if (len < 1) { return Err(invalid_length(len, "a BSON string of at least one byte")); }
-    if (!bs_has(n.rest.in, n.rest.pos, len)) { return Err(eof_error(what)); }
+    if (!bd_has(n.rest, 0, len)) { return Err(eof_error(what)); }
     return Ok(bd_take(n.rest, len));
 }
 
@@ -1103,7 +1114,7 @@ Result(BsonDec, SerialError) bd_skip_bin(BsonDec d, Str what) {
     Parsed(Int, BsonDec) n = bd_i32(d, what)?;
     Int len = n.value;
     if (len < 0) { return Err(invalid_length(len, "a BSON binary length")); }
-    if (!bs_has(n.rest.in, n.rest.pos + 1, len)) { return Err(eof_error(what)); }
+    if (!bd_has(n.rest, 1, len)) { return Err(eof_error(what)); }
     return Ok(bd_take(n.rest, 1 + len));
 }
 
@@ -1113,7 +1124,7 @@ Result(BsonDec, SerialError) bd_skip_doc(BsonDec d, Str what) {
     Int len = n.value;
     if (len < 5) { return Err(invalid_length(len, "a BSON document of at least 5 byte(s)")); }
     Int end = p + len - 1;
-    if (end >= n.rest.in.len()) { return Err(eof_error(what)); }
+    if (end >= bd_room(n.rest)) { return Err(eof_error(what)); }
     if (n.rest.in[end] != 0) { return Err(syntax_error("a BSON document does not end with a zero byte")); }
     return Ok(bd_take(n.rest, end + 1 - n.rest.pos));
 }
