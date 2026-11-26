@@ -132,6 +132,15 @@ Int encoded_length(Value v) {
 }
 
 Int main() {
+    // The nesting limit.
+    check("depth/limit is 64", bson_max_depth() == 64);
+    Result(Value, SerialError) deepest = decode_value(bson_decoder(nested(63)));
+    check_text("depth/64 documents", err_of(deepest), "ok");
+    check_text("depth/65 documents", value_of(nested(64)), "nested deeper than 64 levels");
+    check_text("depth/20000 documents", value_of(nested(20000)), "nested deeper than 64 levels");
+    Result(Value, SerialError) wider = decode_value(bson_decoder_depth(nested(3000), 5000));
+    check_text("depth/a wider limit", err_of(wider), "ok");
+
     // A wide document encodes in one pass.
     check("encode/long array", encoded_length(vstruct("B", [vfield("xs", VSeq(ints(0, 20000, ListBuf())))])) == 208904);
     check("encode/wide document", encoded_length(vstruct("B", fields(0, 20000, ListBuf()))) == 228895);

@@ -420,43 +420,88 @@ type BsFrame = BsDoc(Int) | BsStr(Int) | BsBin(Int);
 // name comes after it and the value's own bytes come after the name. So the
 // verb that reads the name leaves the type behind for the verb that reads
 // the value, and etype is -1 when no element is waiting for its value.
+// The open frames, innermost first: a push, a pop and a look at the top
+// are each O(1), whatever the depth.
+type BsStack = BkNil | BkCons(BkCell);
+type BkCell = { BsFrame top; BsStack below; };
+
 type BsonDec = {
     List(Int) in;
     Int pos;
-    List(BsFrame) open;
+    BsStack open;
+    Int depth;         // documents and arrays open, variant documents included
+    Int max_depth;     // how deep they may nest (bson_max_depth by default)
     Int payloads;
     Int vmaps;
     Int etype;
     Bool mkey;
 };
 
-pub BsonDec bson_decoder(List(Int) bs) {
-    List(BsFrame) none = [];
-    return BsonDec {.in = bs, .pos = 0, .open = none, .payloads = 0, .vmaps = 0, .etype = 0 - 1, .mkey = false};
+/// How deeply documents and arrays may nest in the input `from_bson`
+/// reads: 64 (the top-level document is the first). One nested deeper is
+/// refused with a syntax error ("nested deeper than 64 levels") as soon as
+/// its length is read, so the time and memory a decode takes stay linear
+/// in the input. `bson_decoder_depth` sets another limit.
+pub Int bson_max_depth() { return 64; }
+
+pub BsonDec bson_decoder(List(Int) bs) { return bson_decoder_depth(bs, bson_max_depth()); }
+
+/// A decoder that allows `max_depth` levels of documents and arrays instead
+/// of `bson_max_depth()`.
+pub BsonDec bson_decoder_depth(List(Int) bs, Int max_depth) {
+    return BsonDec {.in = bs, .pos = 0, .open = BkNil, .depth = 0, .max_depth = max_depth, .payloads = 0, .vmaps = 0, .etype = 0 - 1, .mkey = false};
 }
 
-BsonDec bd_at(BsonDec d, Int pos, List(BsFrame) open) { return bd_key(d, d.mkey, pos, open); }
+BsonDec bd_at(BsonDec d, Int pos, BsStack open) { return bd_key(d, d.mkey, pos, open); }
 
-BsonDec bd_key(BsonDec d, Bool mkey, Int pos, List(BsFrame) open) {
-    return BsonDec {.in = d.in, .pos = pos, .open = open, .payloads = d.payloads, .vmaps = d.vmaps, .etype = d.etype, .mkey = mkey};
+BsonDec bd_key(BsonDec d, Bool mkey, Int pos, BsStack open) {
+    return BsonDec {.in = d.in, .pos = pos, .open = open, .depth = d.depth, .max_depth = d.max_depth, .payloads = d.payloads, .vmaps = d.vmaps, .etype = d.etype, .mkey = mkey};
 }
 
-BsonDec bd_push(BsonDec d, BsFrame f) { return bd_at(d, d.pos, d.open.concat([f])); }
+BsonDec bd_depth(BsonDec d, Int depth) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .depth = depth, .max_depth = d.max_depth, .payloads = d.payloads, .vmaps = d.vmaps, .etype = d.etype, .mkey = d.mkey}; }
+
+Bool bs_is_doc(BsFrame f) { return match f { BsDoc(_) => true, BsStr(_) => false, BsBin(_) => false }; }
+
+// A string's or a binary's frame on top.
+BsonDec bd_push(BsonDec d, BsFrame f) { return bd_at(d, d.pos, BkCons(BkCell {.top = f, .below = d.open})); }
+
+// A document's frame on top, one level deeper: past the limit it is
+// refused.
+Result(BsonDec, SerialError) bd_open_doc(BsonDec d, Int end) {
+    if (d.depth >= d.max_depth) { return Err(syntax_error(f"nested deeper than {d.max_depth} levels")); }
+    return Ok(bd_depth(bd_push(d, BsDoc(end)), d.depth + 1));
+}
+
 BsonDec bd_pop(BsonDec d) {
-    Int k = d.open.len();
-    if (k == 0) { return d; }
-    return bd_at(d, d.pos, d.open[0..k - 1]);
+    BsStack o = d.open;
+    return match o {
+        BkNil => d,
+        BkCons(c) => bd_drop(bd_at(d, d.pos, c.below), bs_is_doc(c.top))
+    };
 }
+
+// The state with a frame gone: one level shallower when it was a document.
+BsonDec bd_drop(BsonDec d, Bool doc) {
+    if (doc) { return bd_depth(d, d.depth - 1); }
+    return d;
+}
+
 BsonDec bd_take(BsonDec d, Int n) { return bd_at(d, d.pos + n, d.open); }
-BsonDec bd_payloads(BsonDec d, Int n) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = n, .vmaps = d.vmaps, .etype = d.etype, .mkey = d.mkey}; }
-BsonDec bd_vmaps(BsonDec d, Int n) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = d.payloads, .vmaps = n, .etype = d.etype, .mkey = d.mkey}; }
+BsonDec bd_payloads(BsonDec d, Int n) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .depth = d.depth, .max_depth = d.max_depth, .payloads = n, .vmaps = d.vmaps, .etype = d.etype, .mkey = d.mkey}; }
+BsonDec bd_vmaps(BsonDec d, Int n) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .depth = d.depth, .max_depth = d.max_depth, .payloads = d.payloads, .vmaps = n, .etype = d.etype, .mkey = d.mkey}; }
 
 // The element whose value is about to be read, and its type.
-BsonDec bd_pending(BsonDec d, Int t) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = d.payloads, .vmaps = d.vmaps, .etype = t, .mkey = d.mkey}; }
+BsonDec bd_pending(BsonDec d, Int t) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .depth = d.depth, .max_depth = d.max_depth, .payloads = d.payloads, .vmaps = d.vmaps, .etype = t, .mkey = d.mkey}; }
 
 // The next element is a map key: its name is the key, and the type behind
 // it belongs to the value.
-BsonDec bd_mkey(BsonDec d, Int t) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = d.payloads, .vmaps = d.vmaps, .etype = t, .mkey = true}; }
+BsonDec bd_mkey(BsonDec d, Int t) { return BsonDec {.in = d.in, .pos = d.pos, .open = d.open, .depth = d.depth, .max_depth = d.max_depth, .payloads = d.payloads, .vmaps = d.vmaps, .etype = t, .mkey = true}; }
+
+// The top frame, or `none` when nothing is open.
+BsFrame bd_top(BsonDec d, BsFrame none) {
+    BsStack o = d.open;
+    return match o { BkNil => none, BkCons(c) => c.top };
+}
 
 // The type of the value that comes next: the element's own, or a fresh
 // type byte at the top level.
@@ -475,9 +520,7 @@ type BsOpen = { Int type; BsonDec rest; };
 
 // Where the open document's content ends, or -1 when no document is open.
 Int bd_doc_end(BsonDec d) {
-    Int k = d.open.len();
-    if (k == 0) { return 0 - 1; }
-    BsFrame f = d.open[k - 1];
+    BsFrame f = bd_top(d, BsStr(0 - 1));
     return match f { BsDoc(end) => end, BsStr(_) => 0 - 1, BsBin(_) => 0 - 1 };
 }
 
@@ -659,9 +702,7 @@ Result(Parsed(Str, BsonDec), SerialError) bd_str_body(BsonDec d, Str what) {
 
 // Where the open string's content ends, or -1.
 Int bd_str_end(BsonDec d) {
-    Int k = d.open.len();
-    if (k == 0) { return 0 - 1; }
-    BsFrame f = d.open[k - 1];
+    BsFrame f = bd_top(d, BsDoc(0 - 1));
     return match f { BsStr(end) => end, BsDoc(_) => 0 - 1, BsBin(_) => 0 - 1 };
 }
 
@@ -725,9 +766,7 @@ Result(Parsed(Int, BsonDec), SerialError) bd_bytes_begin(BsonDec d) {
 }
 
 Result(Parsed(Int, BsonDec), SerialError) bd_bytes_next(BsonDec d) {
-    Int k = d.open.len();
-    if (k == 0) { return Err(custom_error("no binary is open")); }
-    BsFrame f = d.open[k - 1];
+    BsFrame f = bd_top(d, BsDoc(0 - 1));
     Int end = match f { BsBin(e) => e, BsDoc(_) => 0 - 1, BsStr(_) => 0 - 1 };
     if (end < 0) { return Err(custom_error("no binary is open")); }
     if (d.pos >= end) { return parsed(0 - 1, bd_pop(d)); }
@@ -811,7 +850,7 @@ Result(BsonDec, SerialError) bd_doc_open(BsonDec d, Str what) {
     Int end = p + len - 1;
     if (end >= n.rest.in.len()) { return Err(eof_error(what)); }
     if (n.rest.in[end] != 0) { return Err(syntax_error("a BSON document does not end with a zero byte")); }
-    return Ok(bd_push(n.rest, BsDoc(end)));
+    return bd_open_doc(n.rest, end);
 }
 
 // The next element of the open document: its type byte and name read, with
