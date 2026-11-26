@@ -738,7 +738,7 @@ Result(Parsed(Int, BsonDec), SerialError) bd_str_next(BsonDec d) {
         if (d.in[end] != 0) { return Err(syntax_error("a BSON string does not end with a zero byte")); }
         return parsed(0 - 1, bd_take(bd_pop(d), 1));
     }
-    BsCp c = bs_cp_at(d.in, d.pos, "a string")?;
+    BsCp c = bs_cp_in(d.in, d.pos, end, "a string")?;
     return parsed(c.cp, bd_take(d, c.next - d.pos));
 }
 

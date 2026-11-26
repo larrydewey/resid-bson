@@ -152,6 +152,14 @@ Int main() {
     List(Int) str_long = [0x1F, 0, 0, 0, 0x03, 0x6F, 0, 0x10, 0, 0, 0, 0x02, 0x73, 0, 8, 0, 0, 0, 0x61, 0x62, 0x63, 0, 0, 0x10, 0x78, 0, 7, 0, 0, 0, 0];
     check_text("room/string past its document", value_of(str_long), "unexpected end of input, expected a map");
 
+    // One spelling of each character.
+    check_text("utf8/overlong", value_of(string_doc([0xC0, 0xAF])), "invalid UTF-8 in a string: byte 192 never starts a character");
+    check_text("utf8/overlong 3", value_of(string_doc([0xE0, 0x80, 0xAF])), "invalid UTF-8 in a string: an overlong form");
+    check_text("utf8/surrogate", value_of(string_doc([0xED, 0xA0, 0x80])), "invalid UTF-8 in a string: a surrogate");
+    check_text("utf8/past U+10FFFF", value_of(string_doc([0xF4, 0x90, 0x80, 0x80])), "invalid UTF-8 in a string: past U+10FFFF");
+    check_text("utf8/four bytes", value_of(string_doc([0xF0, 0x9F, 0x98, 0x80])), "{\"s\": \"" + str_from_code(128512) + "\"}");
+    check_text("utf8/in a name", value_of([0x0D, 0, 0, 0, 0x10, 0xC0, 0xAF, 0, 1, 0, 0, 0, 0]), "invalid UTF-8 in a map key: byte 192 never starts a character");
+
     // A wide document encodes in one pass.
     check("encode/long array", encoded_length(vstruct("B", [vfield("xs", VSeq(ints(0, 20000, ListBuf())))])) == 208904);
     check("encode/wide document", encoded_length(vstruct("B", fields(0, 20000, ListBuf()))) == 228895);
